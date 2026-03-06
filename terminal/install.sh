@@ -2,7 +2,7 @@
 
 ## Updating the system
 
-sleep 3
+sleep 0
 
 sudo dnf update -y && sudo dnf install figlet fish fastfetch -y
 
@@ -11,7 +11,7 @@ sleep 1
 ## Installing Starship
 figlet "Installing Starship" | sed 's/^/\x1b[36m/' ; echo -e "\x1b[0m"
 
-sleep 4
+sleep 1
 curl -sS https://starship.rs/install.sh | sh
 
 sleep 1
@@ -20,7 +20,7 @@ sleep 1
 
 figlet "Installing shell configuration" | sed 's/^/\x1b[36m/' ; echo -e "\x1b[0m"
 
-sleep 3
+sleep 1
 
 mkdir -p ~/.config
 
@@ -31,7 +31,7 @@ sudo cp -r * /root/.config/
 
 chsh -s /bin/fish
 
-sleep 3
+sleep 1
 
 sudo chsh -s /bin/fish
 sleep 1
@@ -45,9 +45,9 @@ read fontans
 
 if [[ $fontans == "y" || $fontans == "Y" ]]; then
   sudo cp -r ~/laxmikant-terminal/fonts/* /usr/share/fonts
-  sleep 2
+  sleep 0
   sudo fc-cache -fv
-  sleep 2
+  sleep 0
   cd ~
   
 else
@@ -68,9 +68,9 @@ if [[ $grubans == "y" || $grubans == "Y" ]]; then
   git clone https://github.com/ChrisTitusTech/Top-5-Bootloader-Themes
   cd Top-5-Bootloader-Themes
   sudo ./install.sh
-  sleep 5
+  sleep 1
   sudo grub2-mkconfig -o /boot/grub2/grub.cfg
-  sleep 2
+  sleep 1
   cd ~
 else
   echo "Okkayy, skipping the Bootloader configuration :-)..."
