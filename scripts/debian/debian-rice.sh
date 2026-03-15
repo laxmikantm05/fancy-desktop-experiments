@@ -54,7 +54,7 @@ banner "Updating the System"
 if ask "Shall we proceed with upgrading the system and Installing all Dependecies sir ?? [Y/n]"; then
     sudo apt update -y
     sudo apt upgrade
-    sudo apt install -y fish fastfetch curl libgnome-menu-3-0 gir1.2-gmenu-3.0 ptyxis pipx wlogout gnome-extensions-app gnome-shell-extension-caffeine gnome-shell-extension-gsconnect gnome-shell-extension-user-theme 
+    sudo apt install -y fish fastfetch curl libgnome-menu-3-0 gir1.2-gmenu-3.0 ptyxis pipx wlogout gnome-extensions-app gnome-shell-extension-caffeine gnome-shell-extension-gsconnect gnome-shell-extension-user-theme gnome-shell-extension-launch-new-instance gnome-shell-extensions-extra
 fi
 
 # =============================================================================
