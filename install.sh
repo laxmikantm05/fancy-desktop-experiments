@@ -15,9 +15,9 @@ error() { echo -e "${RED}[ERROR]${RESET} $*"; exit 1; }
 # ── Install figlet if not present ─────────
 if ! command -v figlet &>/dev/null; then
     if command -v apt &>/dev/null; then
-        sudo apt install -y figlet &>/dev/null
+        sudo apt install -y figlet gum &>/dev/null
     elif command -v dnf &>/dev/null; then
-        sudo dnf install -y figlet &>/dev/null
+        sudo dnf install -y figlet gum &>/dev/null
     fi
 fi
 
