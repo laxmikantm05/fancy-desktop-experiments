@@ -150,3 +150,4 @@ function fish_command_not_found
     set_color normal
     set -g __last_command_not_found 1
 end
+
