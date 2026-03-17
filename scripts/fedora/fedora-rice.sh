@@ -194,14 +194,34 @@ module_system_update() {
 module_shell() {
     section "Shell Setup"
     if confirm "Set fish as your default shell?"; then
-        run_direct "setting fish as default shell" chsh -s "$(which fish)"
-        success "fish set as default for $USER"
 
-        if confirm "Also set fish as default for root?"; then
-            run_direct "setting fish for root" sudo chsh -s "$(which fish)" root
-            success "fish set as default for root"
-        else
-            skip "root shell"
+        # robustly get full path — check common locations as fallback
+        FISH_PATH="$(command -v fish 2>/dev/null)"
+        if [[ -z "$FISH_PATH" ]]; then
+            for p in /usr/bin/fish /usr/local/bin/fish /bin/fish; do
+                [[ -x "$p" ]] && FISH_PATH="$p" && break
+            done
+        fi
+
+        if [[ -z "$FISH_PATH" ]]; then
+            fail "fish not found — is it installed?"
+            return 1
+        fi
+
+        # ensure fish is listed in /etc/shells (required by chsh)
+        grep -qxF "$FISH_PATH" /etc/shells || echo "$FISH_PATH" | sudo tee -a /etc/shells > /dev/null
+
+        run_direct "setting fish as default shell" chsh -s "$FISH_PATH"
+        if [[ $? -eq 0 ]]; then
+            success "fish set as default for $USER"
+
+            if confirm "Also set fish as default for root?"; then
+                grep -qxF "$FISH_PATH" /etc/shells || echo "$FISH_PATH" | sudo tee -a /etc/shells > /dev/null
+                run_direct "setting fish for root" sudo chsh -s "$FISH_PATH" root
+                [[ $? -eq 0 ]] && success "fish set as default for root" || fail "could not set fish for root"
+            else
+                skip "root shell"
+            fi
         fi
     else
         skip "shell setup"
