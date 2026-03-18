@@ -210,6 +210,7 @@ module_dotfiles() {
         run_spin "copying dotfiles to /root/.config" \
             sudo cp -r "$DOTFILES_DIR/.config/." /root/.config/
         run_direct "installing starship" \
+            gsettings set 'org.gnome.Ptyxis.Profile:/org/gnome/Ptyxis/Profiles/'$PTYXIS_PROFILE'/' 'opacity' '0.55'
             bash -c "curl -sS https://starship.rs/install.sh | sh"
         success "dotfiles and starship ready"
     else
