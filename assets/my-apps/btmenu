@@ -1,455 +1,710 @@
 #!/usr/bin/env python3
-# ─────────────────────────────────────────
-#  CYBERPUNK BLUETOOTH MENU  —  full TUI
-#  install: sudo cp btmenu /usr/local/bin/ && sudo chmod +x /usr/local/bin/btmenu
-#  deps: python3, bluetoothctl, dbus-python (optional, for battery)
-# ─────────────────────────────────────────
+"""
+CYBERPUNK BTMENU
+install : sudo cp btmenu /usr/local/bin/ && sudo chmod +x /usr/local/bin/btmenu
+deps    : pip install textual --break-system-packages
+optional: headsetcontrol (AirPods L/R/Case battery), pactl (audio profiles)
+"""
 
-import curses
-import subprocess
-import threading
-import time
-import os
-import re
+import sys
+if "--help" in sys.argv or "-h" in sys.argv:
+    print("""btmenu — cyberpunk Bluetooth manager
 
-# ── bluetoothctl helpers ─────────────────────────────────────────
+keybinds:
+  [Enter]   connect / disconnect selected device
+  [S]       scan for new nearby devices
+  [P]       switch audio profile (headphones/headset)
+  [N]       rename device
+  [U]       toggle trust (auto-connect) on/off
+  [X]       remove / unpair device
+  [T]       toggle Bluetooth on/off
+  [R]       refresh device list
+  [Esc]     back from scan mode / quit
+  [Q]       quit
 
-def bt_cmd(*args, timeout=10):
+config: ~/.config/fancy-desktop/config.toml
+""")
+    sys.exit(0)
+
+import subprocess, time, os, re, json, pathlib, datetime
+from textual.app        import App, ComposeResult
+from textual.widgets    import (ListView, ListItem, Label, Static,
+                                Input, Button, Footer)
+from textual.containers import Horizontal, Vertical, Container
+from textual.screen     import ModalScreen
+from textual.binding    import Binding
+from textual            import work, on
+
+# ── config ───────────────────────────────────────────────────────
+
+def load_config():
+    cfg = {"bluetooth": {"refresh_interval": 5, "header_interval": 2}}
+    p   = pathlib.Path.home() / ".config" / "fancy-desktop" / "config.toml"
+    if not p.exists(): return cfg
     try:
-        r = subprocess.run(
-            ["bluetoothctl"] + list(args),
-            capture_output=True, text=True, timeout=timeout
-        )
+        import tomllib
+        with open(p, "rb") as f:
+            data = tomllib.load(f)
+        cfg["bluetooth"].update(data.get("bluetooth", {}))
+    except Exception:
+        pass
+    return cfg
+
+CFG = load_config()
+
+# ── bluetooth helpers ─────────────────────────────────────────────
+
+def run(cmd, timeout=12):
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
         return r.stdout.strip(), r.returncode
     except Exception:
         return "", 1
 
+def notify(title, body, urgency="normal"):
+    try:
+        subprocess.Popen(["notify-send", "-u", urgency, "-a", "btmenu", title, body],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:
+        pass
+
 def bt_powered():
-    out, _ = bt_cmd("show")
+    out, _ = run(["bluetoothctl", "show"])
     for line in out.splitlines():
         if "Powered:" in line:
             return "yes" in line.lower()
     return False
 
-def bt_toggle():
-    if bt_powered():
-        bt_cmd("power", "off")
-    else:
-        bt_cmd("power", "on")
+def toggle_bt():
+    run(["bluetoothctl", "power", "off" if bt_powered() else "on"])
 
 def get_devices():
-    """Return list of known (paired/connected) devices."""
-    out, _ = bt_cmd("devices")
-    devices = []
+    out, _ = run(["bluetoothctl", "devices"])
+    devs = []
     for line in out.splitlines():
-        # format: Device AA:BB:CC:DD:EE:FF Name
-        parts = line.strip().split(" ", 2)
-        if len(parts) >= 3 and parts[0] == "Device":
-            devices.append({"mac": parts[1], "name": parts[2], "connected": False, "battery": None, "type": "?"})
-    return devices
+        p = line.strip().split(" ", 2)
+        if len(p) >= 3 and p[0] == "Device":
+            devs.append({"mac": p[1], "name": p[2],
+                         "connected": False, "paired": True,
+                         "trusted": False, "battery": None, "type": "unknown"})
+    return devs
 
-def enrich_device(dev):
-    """Fill in connected status, battery, type for a single device."""
-    out, _ = bt_cmd("info", dev["mac"])
+def enrich(dev):
+    out, _ = run(["bluetoothctl", "info", dev["mac"]])
     for line in out.splitlines():
-        line = line.strip()
-        if line.startswith("Connected:"):
-            dev["connected"] = "yes" in line.lower()
-        elif line.startswith("Icon:"):
-            icon = line.split(":", 1)[-1].strip()
-            dev["type"] = icon
-        elif "Battery Percentage" in line:
-            match = re.search(r'\((\d+)\)', line)
-            if match:
-                dev["battery"] = int(match.group(1))
+        s = line.strip()
+        if s.startswith("Connected:"): dev["connected"] = "yes" in s.lower()
+        elif s.startswith("Paired:"):  dev["paired"]    = "yes" in s.lower()
+        elif s.startswith("Trusted:"): dev["trusted"]   = "yes" in s.lower()
+        elif s.startswith("Icon:"):    dev["type"]      = s.split(":", 1)[-1].strip()
+        elif "Battery Percentage" in s:
+            m = re.search(r'\((\d+)\)', s)
+            if m: dev["battery"] = int(m.group(1))
     return dev
 
-def get_all_devices():
-    devices = get_devices()
-    for dev in devices:
-        enrich_device(dev)
-    return devices
+def load_devices():
+    devs = get_devices()
+    for d in devs:
+        enrich(d)
+    return devs
 
-def scan_new_devices(duration=10):
-    """Scan for nearby unpaired devices."""
-    found = []
+def scan_nearby(duration=10):
     try:
         proc = subprocess.Popen(
             ["bluetoothctl", "scan", "on"],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
-        )
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         time.sleep(duration)
         proc.terminate()
     except Exception:
         pass
-
-    # get all devices including newly discovered
-    out, _ = bt_cmd("devices")
+    out, _ = run(["bluetoothctl", "devices"])
+    found = []
     for line in out.splitlines():
-        parts = line.strip().split(" ", 2)
-        if len(parts) >= 3 and parts[0] == "Device":
-            found.append({"mac": parts[1], "name": parts[2], "connected": False, "battery": None, "type": "?"})
+        p = line.strip().split(" ", 2)
+        if len(p) >= 3 and p[0] == "Device":
+            found.append({"mac": p[1], "name": p[2],
+                          "connected": False, "paired": False,
+                          "trusted": False, "battery": None, "type": "unknown"})
     return found
 
-def connect_device(mac):
-    _, rc = bt_cmd("connect", mac, timeout=15)
+def do_connect(mac):
+    _, rc = run(["bluetoothctl", "connect", mac], timeout=15)
     return rc == 0
 
-def disconnect_device(mac):
-    _, rc = bt_cmd("disconnect", mac)
+def do_disconnect(mac):
+    _, rc = run(["bluetoothctl", "disconnect", mac])
     return rc == 0
 
-def pair_device(mac):
-    _, rc = bt_cmd("pair", mac, timeout=20)
+def do_pair(mac):
+    _, rc = run(["bluetoothctl", "pair", mac], timeout=20)
     return rc == 0
 
-def trust_device(mac):
-    bt_cmd("trust", mac)
-
-def remove_device(mac):
-    _, rc = bt_cmd("remove", mac)
+def do_trust(mac):    run(["bluetoothctl", "trust",   mac])
+def do_untrust(mac):  run(["bluetoothctl", "untrust", mac])
+def do_remove(mac):
+    _, rc = run(["bluetoothctl", "remove", mac])
     return rc == 0
 
-# ── headsetcontrol battery (AirPods / multi-battery devices) ─────
+def do_rename(mac, name):
+    run(["bluetoothctl", "system-alias", mac, name])
 
-def headsetcontrol_battery():
-    """Try headsetcontrol for L/R/Case battery. Returns dict or None."""
+# ── audio profiles ────────────────────────────────────────────────
+
+def get_bt_card(mac):
+    card_name = "bluez_card." + mac.replace(":", "_")
+    out, _    = run(["pactl", "list", "cards", "short"])
+    for line in out.splitlines():
+        if mac.replace(":", "_") in line or card_name in line:
+            return line.split()[1] if len(line.split()) > 1 else card_name
+    return card_name
+
+def get_audio_profiles(mac):
+    card  = get_bt_card(mac)
+    out, _ = run(["pactl", "list", "cards"])
+    profiles = []
+    in_card  = False
+    in_profs = False
+    active   = None
+    for line in out.splitlines():
+        if mac.replace(":", "_") in line or card in line:
+            in_card = True
+        if in_card and "Active Profile:" in line:
+            active = line.split(":", 1)[-1].strip()
+        if in_card and "Profiles:" in line:
+            in_profs = True
+            continue
+        if in_profs:
+            if line.startswith("\t\t"):
+                name = line.strip().split(":")[0].strip()
+                if name and name != "off":
+                    profiles.append(name)
+            elif line.startswith("\t") and not line.startswith("\t\t"):
+                in_profs = False
+    return profiles, active, card
+
+def set_audio_profile(card, profile):
+    _, rc = run(["pactl", "set-card-profile", card, profile])
+    return rc == 0
+
+# ── headsetcontrol ────────────────────────────────────────────────
+
+def hsc_battery():
     try:
-        r = subprocess.run(
-            ["headsetcontrol", "-b", "-o", "json"],
-            capture_output=True, text=True, timeout=5
-        )
-        if r.returncode != 0:
-            return None
-        import json
-        data = json.loads(r.stdout)
-        result = {}
-        devices = data.get("devices", [])
-        if not devices:
-            return None
-        dev = devices[0]
-        batt = dev.get("battery", {})
-        if batt.get("left")   is not None: result["left"]  = batt["left"]
-        if batt.get("right")  is not None: result["right"] = batt["right"]
-        if batt.get("case")   is not None: result["case"]  = batt["case"]
-        if batt.get("level")  is not None: result["level"] = batt["level"]
-        return result if result else None
+        r = subprocess.run(["headsetcontrol", "-b", "-o", "json"],
+                           capture_output=True, text=True, timeout=5)
+        if r.returncode != 0: return None
+        data  = json.loads(r.stdout)
+        devs  = data.get("devices", [])
+        if not devs: return None
+        batt  = devs[0].get("battery", {})
+        result = {k: batt[k] for k in ("left", "right", "case", "level") if batt.get(k) is not None}
+        return result or None
     except Exception:
         return None
 
-# ── type icon map ─────────────────────────────────────────────────
+# ── visual ────────────────────────────────────────────────────────
 
 def type_icon(t):
     t = (t or "").lower()
-    if "headset"    in t or "headphone" in t or "audio"  in t: return "󰋋"
-    if "phone"      in t:                                        return "󰄜"
-    if "computer"   in t or "laptop"    in t:                    return "󰌢"
-    if "keyboard"   in t:                                        return "󰌌"
-    if "mouse"      in t:                                        return "󰍽"
-    if "joystick"   in t or "gamepad"   in t:                    return "󰺵"
-    if "speaker"    in t:                                        return "󰓃"
+    if any(x in t for x in ("headset", "headphone", "audio")): return "󰋋"
+    if "phone"    in t: return "󰄜"
+    if "computer" in t: return "󰌢"
+    if "keyboard" in t: return "󰌌"
+    if "mouse"    in t: return "󰍽"
+    if "joystick" in t: return "󰺵"
+    if "speaker"  in t: return "󰓃"
     return "󰂯"
 
-# ── battery bar ───────────────────────────────────────────────────
-
-def battery_bar(pct):
-    if pct is None:
-        return "  ---- "
+def batt_bar(pct):
+    if pct is None: return "[dim]── no data ──[/dim]"
     filled = round(pct / 10)
-    bar    = "█" * filled + "░" * (10 - filled)
-    return f"  {bar} {pct:3}%"
+    color  = "green" if pct > 50 else ("yellow" if pct > 20 else "red")
+    return f"[{color}]{'█' * filled}[/{color}][dim]{'░' * (10 - filled)}[/dim]  [{color}]{pct}%[/{color}]"
 
-# ── main TUI ──────────────────────────────────────────────────────
+# ── modals ────────────────────────────────────────────────────────
 
-def main(stdscr):
-    curses.curs_set(0)
-    curses.use_default_colors()
-    curses.start_color()
+MODAL_CSS = """
+Screen { align: center middle; }
+.modal-box {
+    border: double #ff2d5a; background: #0d0d1a;
+    padding: 1 2; min-width: 54;
+}
+.modal-title { color: #ff2d5a; text-style: bold; margin-bottom: 1; }
+.modal-sub   { color: #00eeff; text-style: bold; margin-bottom: 1; }
+.modal-hint  { color: #444466; margin-top: 1; }
+Input {
+    border: solid #444466; background: #0a0a16;
+    color: #ccccee; margin-bottom: 1;
+}
+Input:focus { border: solid #ff2d5a; }
+.btn-row    { height: 3; align: center middle; }
+Button      { margin: 0 1; min-width: 14; border: none; }
+.btn-ok     { background: #ff2d5a; color: #ffffff; }
+.btn-cancel { background: #333344; color: #aaaacc; }
+"""
 
-    curses.init_pair(1,  -1,   -1)       # default
-    curses.init_pair(2,  238,  -1)       # dim
-    curses.init_pair(3,  51,   -1)       # cyan accent
-    curses.init_pair(4,  16,   51)       # selected (black on cyan)
-    curses.init_pair(5,  240,  -1)       # footer hints
-    curses.init_pair(6,  201,  -1)       # pink accent
-    curses.init_pair(7,  82,   -1)       # green ok
-    curses.init_pair(8,  226,  -1)       # yellow warning
-    curses.init_pair(9,  196,  -1)       # red error
-    curses.init_pair(10, 82,   -1)       # connected device
-    curses.init_pair(11, 39,   -1)       # light blue (scan mode)
+class RenameModal(ModalScreen):
+    CSS = MODAL_CSS
+    def __init__(self, dev):
+        super().__init__()
+        self.dev = dev
+    def compose(self):
+        with Container(classes="modal-box"):
+            yield Label("  rename device", classes="modal-title")
+            yield Label(f"  {self.dev['name']}", classes="modal-sub")
+            yield Input(placeholder="  new name...", value=self.dev["name"], id="inp")
+            yield Label("  [Enter] confirm   [Esc] cancel", classes="modal-hint")
+    def on_mount(self): self.query_one("#inp", Input).focus()
+    @on(Input.Submitted)
+    def submitted(self, e): self.dismiss(e.value.strip() or None)
+    def on_key(self, e):
+        if e.key == "escape": self.dismiss(None)
 
-    stdscr.bkgd(" ", curses.color_pair(1))
-    stdscr.keypad(True)
-    stdscr.nodelay(False)
+class AudioProfileModal(ModalScreen):
+    CSS = MODAL_CSS + """
+    ListView { height: 10; background: #0d0d1a; border: solid #1a1a3a; margin-bottom: 1; }
+    ListItem { height: 2; background: #0d0d1a; border-bottom: solid #0f0f1f; }
+    ListView:focus > ListItem.--highlight { background: #005f7f; border-left: tall #ff2d5a; }
+    ListView:focus > ListItem.--highlight Label { color: #00eeff; text-style: bold; }
+    """
+    def __init__(self, profiles, active):
+        super().__init__()
+        self.profiles = profiles
+        self.active   = active
+    def compose(self):
+        with Container(classes="modal-box"):
+            yield Label("  audio profile", classes="modal-title")
+            yield Label(f"  active: {self.active or 'unknown'}", classes="modal-sub")
+            lv = ListView(id="prof-list")
+            yield lv
+            yield Label("  [Enter] select   [Esc] cancel", classes="modal-hint")
+    def on_mount(self):
+        lv = self.query_one("#prof-list", ListView)
+        for p in self.profiles:
+            marker = "  [green]◉[/green]  " if p == self.active else "     "
+            lv.append(ListItem(Label(f"{marker}{p}", markup=True)))
+        lv.focus()
+    @on(ListView.Selected)
+    def selected(self, e):
+        idx = e.list_view.index
+        if idx is not None and idx < len(self.profiles):
+            self.dismiss(self.profiles[idx])
+    def on_key(self, e):
+        if e.key == "escape": self.dismiss(None)
 
-    devices      = []
-    scan_results = []
-    selected     = 0
-    status_msg   = "  press r to refresh devices   s to scan for new"
-    status_color = 5
-    loading      = False
-    load_done    = threading.Event()
-    scan_mode    = False      # True = showing scan results, False = paired devices
-    hsc_battery  = None       # headsetcontrol result
+# ── app ───────────────────────────────────────────────────────────
 
-    def do_refresh():
-        nonlocal devices, loading, status_msg, status_color, hsc_battery
-        loading      = True
-        status_msg   = "  loading devices..."
-        status_color = 8
-        try:
-            devices      = get_all_devices()
-            hsc_battery  = headsetcontrol_battery()
-            status_msg   = f"  {len(devices)} device{'s' if len(devices) != 1 else ''} found"
-            status_color = 7
-        except Exception as e:
-            status_msg   = f"  error: {e}"
-            status_color = 9
-        loading = False
-        load_done.set()
+class BtApp(App):
+    CSS = """
+    Screen { background: #0a0005; color: #cccccc; }
 
-    def do_scan():
-        nonlocal scan_results, loading, status_msg, status_color, scan_mode
-        loading      = True
-        scan_mode    = True
-        status_msg   = "  scanning for 10 seconds..."
-        status_color = 11
-        try:
-            scan_results = scan_new_devices(10)
-            status_msg   = f"  found {len(scan_results)} device{'s' if len(scan_results) != 1 else ''} nearby"
-            status_color = 7
-        except Exception as e:
-            status_msg   = f"  scan error: {e}"
-            status_color = 9
-        loading = False
-        load_done.set()
+    #header {
+        height: 3; dock: top;
+        background: #0a0005;
+        border-bottom: solid #cc0022;
+        padding: 0 2;
+        content-align: left middle;
+    }
 
-    def current_list():
-        return scan_results if scan_mode else devices
+    #body { height: 1fr; margin-bottom: 3; }
 
-    def draw():
-        nonlocal selected
-        stdscr.erase()
-        h, w = stdscr.getmaxyx()
-        bar  = "─" * (w - 2)
+    #left-panel {
+        width: 40%;
+        border-right: solid #330011;
+    }
 
-        # ── top border + header ──
-        stdscr.addstr(0, 0, "╭" + bar + "╮", curses.color_pair(3))
+    #right-panel { width: 1fr; }
 
-        powered     = bt_powered()
-        bt_label    = "  BT: ON " if powered else "  BT: OFF "
-        bt_color    = curses.color_pair(7) if powered else curses.color_pair(9)
-        mode_label  = "  [scan results]" if scan_mode else ""
+    .panel-title {
+        height: 3;
+        background: #1a0008;
+        color: #ff0033;
+        text-style: bold;
+        content-align: left middle;
+        padding: 0 2;
+        border-bottom: solid #330011;
+    }
 
-        stdscr.addstr(1, 1, "  󰂯  btmenu" + mode_label, curses.color_pair(3) | curses.A_BOLD)
-        stdscr.addstr(1, w - len(bt_label) - 1, bt_label, bt_color | curses.A_BOLD)
+    ListView {
+        background: #0a0005;
+        height: 1fr;
+        scrollbar-color: #cc0022;
+        scrollbar-background: #0a0005;
+        border: none;
+        padding: 0;
+    }
 
-        # connected device summary
-        connected = [d for d in devices if d["connected"]]
-        if connected:
-            names = "  ◉  " + "   ◉  ".join(d["name"] for d in connected)
-            stdscr.addstr(2, 1, names[:w-2], curses.color_pair(10))
-        else:
-            stdscr.addstr(2, 1, "  ○  no devices connected", curses.color_pair(2))
+    ListView:focus { border: none; outline: none; }
 
-        # headsetcontrol multi-battery row
-        row3_y = 3
-        if hsc_battery:
+    ListItem {
+        padding: 0;
+        height: 2;
+        background: #0a0005;
+        border-bottom: solid #1a0008;
+    }
+
+    ListItem:hover { background: #1a0008; }
+
+    ListView > ListItem.--highlight {
+        background: #003f5c;
+        border-left: none;
+    }
+
+    ListView:focus > ListItem.--highlight {
+        background: #005f7f;
+        border-left: none;
+    }
+
+    ListView:focus > ListItem.--highlight Label {
+        color: #00eeff;
+        text-style: bold;
+    }
+
+    #details {
+        height: 1fr;
+        padding: 1 3;
+        background: #0a0005;
+        overflow-y: auto;
+    }
+
+    #statusbar {
+        height: 1;
+        background: #1a0008;
+        color: #888888;
+        padding: 0 2;
+        content-align: left middle;
+    }
+
+    #controls-bar {
+        height: 2;
+        dock: bottom;
+        background: #cc0022;
+        color: #ffffff;
+        text-style: bold;
+        padding: 0 2;
+        content-align: left middle;
+        border-top: solid #ff0033;
+    }
+
+    Footer { display: none; }
+"""
+
+    BINDINGS = [
+        Binding("r",      "refresh",      "[R] Refresh"),
+        Binding("s",      "scan",         "[S] Scan"),
+        Binding("p",      "audio_profile","[P] Profile"),
+        Binding("n",      "rename",       "[N] Rename"),
+        Binding("u",      "trust_toggle", "[U] Trust"),
+        Binding("x",      "remove",       "[X] Remove"),
+        Binding("t",      "toggle",       "[T] Toggle BT"),
+        Binding("q",      "quit",         "[Q] Quit"),
+        Binding("escape", "back_or_quit", "",   show=False),
+        Binding("enter",  "connect",      "[Enter] Connect"),
+    ]
+
+    _devices   = []
+    _scan_list = []
+    _scan_mode = False
+    _hsc       = None
+
+    def compose(self):
+        yield Static("", id="header")
+        with Horizontal(id="body"):
+            with Vertical(id="left-panel"):
+                yield Label("  󰂯  DEVICES", classes="panel-title", id="dev-title")
+                yield ListView(id="device-list")
+            with Vertical(id="right-panel"):
+                yield Label("  DETAILS", classes="panel-title")
+                yield Static("", id="details")
+        yield Static("", id="statusbar")
+        yield Static("  [Enter] Connect   [S] Scan   [P] Profile   [N] Rename   [U] Trust   [X] Remove   [T] Toggle   [R] Refresh   [Q] Quit", id="controls-bar")
+
+
+    def on_mount(self):
+        self._refresh_header()
+        self._set_details(None)
+        self.query_one("#device-list").focus()
+        self.action_refresh()
+        self.set_interval(CFG["bluetooth"]["refresh_interval"], self.action_refresh)
+        self.set_interval(CFG["bluetooth"]["header_interval"],  self._refresh_header)
+
+    def _refresh_header(self):
+        on    = bt_powered()
+        flg   = "[green]BT ON[/green]" if on else "[red]BT OFF[/red]"
+        t     = datetime.datetime.now().strftime("%H:%M:%S")
+        conn  = [d for d in self._devices if d.get("connected")]
+        names = ("  [#ff2d5a]◉[/#ff2d5a] " + "   [#ff2d5a]◉[/#ff2d5a] ".join(
+            f"[green]{d['name']}[/green]" for d in conn)
+            ) if conn else "  [dim]○  no devices connected[/dim]"
+        hsc_str = ""
+        if self._hsc:
             parts = []
-            if "left"  in hsc_battery: parts.append(f"L: {hsc_battery['left']}%")
-            if "right" in hsc_battery: parts.append(f"R: {hsc_battery['right']}%")
-            if "case"  in hsc_battery: parts.append(f"Case: {hsc_battery['case']}%")
-            if "level" in hsc_battery: parts.append(f"Battery: {hsc_battery['level']}%")
-            hsc_str = "  󰋋  " + "   ·   ".join(parts)
-            stdscr.addstr(3, 1, hsc_str[:w-2], curses.color_pair(6))
-            row3_y = 4
+            if "left"  in self._hsc: parts.append(f"L {self._hsc['left']}%")
+            if "right" in self._hsc: parts.append(f"R {self._hsc['right']}%")
+            if "case"  in self._hsc: parts.append(f"Case {self._hsc['case']}%")
+            if "level" in self._hsc: parts.append(f"Batt {self._hsc['level']}%")
+            if parts: hsc_str = "  [dim]·[/dim]  [#ff2d5a]󰋋 " + "  ·  ".join(parts) + "[/#ff2d5a]"
+        self.query_one("#header", Static).update(
+            f"  [bold #ff2d5a]󰂯  btmenu[/bold #ff2d5a]{names}{hsc_str}   [dim]{t}[/dim]   {flg}"
+        )
 
-        stdscr.addstr(row3_y, 0, "├" + bar + "┤", curses.color_pair(3))
+    def _current_list(self):
+        return self._scan_list if self._scan_mode else self._devices
 
-        # ── column headers ──
-        hdr_y = row3_y + 1
-        hdr   = f"   {'':2}  {'NAME':<28}  {'TYPE':<12}  {'BATTERY':>17}  STATUS"
-        stdscr.addstr(hdr_y, 0, hdr[:w], curses.color_pair(2) | curses.A_BOLD)
-        stdscr.addstr(hdr_y + 1, 0, "├" + bar + "┤", curses.color_pair(3))
-
-        # ── device list ──
-        list_start = hdr_y + 2
-        list_end   = h - 4
-        list_rows  = max(0, list_end - list_start)
-        devlist    = current_list()
-
-        if selected >= len(devlist) and devlist:
-            selected = len(devlist) - 1
-
-        scroll = max(0, selected - list_rows + 1)
-
-        if not devlist:
-            if not loading:
-                msg = "  no devices — press r to refresh   s to scan for new" if not scan_mode \
-                      else "  no devices found nearby — press r to go back"
-                stdscr.addstr(list_start + 1, 3, msg[:w-4], curses.color_pair(2))
+    def _set_details(self, dev):
+        d = self.query_one("#details", Static)
+        if dev is None:
+            d.update("\n  [dim]select a device[/dim]")
+            return
+        icon    = type_icon(dev["type"])
+        conn    = dev.get("connected", False)
+        paired  = dev.get("paired", False)
+        trusted = dev.get("trusted", False)
+        lines   = [
+            "", f"  [bold #ff2d5a]{dev['name']}[/bold #ff2d5a]", "",
+            f"  [dim]MAC       [/dim] [dim]{dev['mac']}[/dim]",
+            f"  [dim]Type      [/dim] {icon}  {dev['type']}",
+            f"  [dim]Paired    [/dim] {'[green]yes[/green]' if paired else '[dim]no[/dim]'}",
+            f"  [dim]Trusted   [/dim] {'[green]yes[/green]  [dim](auto-connect on)[/dim]' if trusted else '[dim]no[/dim]  (auto-connect off)'}",
+            f"  [dim]Status    [/dim] {'[green]◉  connected[/green]' if conn else '[dim]○  disconnected[/dim]'}",
+            "",
+            f"  [dim]Battery   [/dim] {batt_bar(dev.get('battery'))}",
+        ]
+        if self._hsc:
+            lines += ["", "  [dim]─── earbuds ────────────────[/dim]"]
+            if "left"  in self._hsc: lines.append(f"  [dim]Left      [/dim] {batt_bar(self._hsc['left'])}")
+            if "right" in self._hsc: lines.append(f"  [dim]Right     [/dim] {batt_bar(self._hsc['right'])}")
+            if "case"  in self._hsc: lines.append(f"  [dim]Case      [/dim] {batt_bar(self._hsc['case'])}")
+        lines += ["", "  [dim]──────────────────[/dim]", ""]
+        if self._scan_mode:
+            lines += ["  [dim][Enter][/dim]  pair this device",
+                      "  [dim]make sure device is in pairing mode[/dim]"]
+        elif conn:
+            lines += ["  [dim][Enter][/dim]  disconnect",
+                      "  [dim][P][/dim]  switch audio profile",
+                      "  [dim][N][/dim]  rename",
+                      "  [dim][U][/dim]  " + ("untrust (disable auto-connect)" if trusted else "trust (enable auto-connect)"),
+                      "  [dim][X][/dim]  remove / unpair"]
+        elif paired:
+            lines += ["  [dim][Enter][/dim]  connect",
+                      "  [dim][N][/dim]  rename",
+                      "  [dim][U][/dim]  " + ("untrust" if trusted else "trust"),
+                      "  [dim][X][/dim]  remove / unpair"]
         else:
-            for i in range(list_rows):
-                idx = i + scroll
-                if idx >= len(devlist):
-                    break
-                dev   = devlist[idx]
-                y     = list_start + i
-                icon  = type_icon(dev["type"])
-                name  = dev["name"][:28]
-                dtype = dev["type"][:12] if dev["type"] != "?" else "unknown"
-                batt  = battery_bar(dev.get("battery"))
-                badge = "◉ connected" if dev.get("connected") else ""
-                row   = f"  {icon}  {name:<28}  {dtype:<12}  {batt}  {badge}"
+            lines += ["  [dim][Enter][/dim]  pair and connect"]
+        d.update("\n".join(lines))
 
-                if idx == selected:
-                    stdscr.attron(curses.color_pair(4) | curses.A_BOLD)
-                    stdscr.addstr(y, 0, " " * (w - 1))
-                    stdscr.addstr(y, 0, row[:w-1])
-                    stdscr.attroff(curses.color_pair(4) | curses.A_BOLD)
-                elif dev.get("connected"):
-                    stdscr.addstr(y, 0, row[:w-1], curses.color_pair(10))
-                else:
-                    stdscr.addstr(y, 0, row[:w-1], curses.color_pair(1))
+    def _rebuild_list(self):
+        lv   = self.query_one("#device-list", ListView)
+        devs = self._current_list()
+        lv.clear()
+        label = f"  󰂲  NEARBY ({len(devs)})" if self._scan_mode else f"  󰂯  DEVICES ({len(devs)})"
+        self.query_one("#dev-title", Label).update(label)
+        for dev in devs:
+            icon     = type_icon(dev["type"])
+            batt_str = f"  [dim]{dev['battery']}%[/dim]" if dev.get("battery") is not None else ""
+            trust_str = "  [dim]★[/dim]" if dev.get("trusted") else ""
+            if dev.get("connected"):
+                row = f"  {icon}  [green]{dev['name']}[/green]{batt_str}{trust_str}  [green]◉[/green]"
+            else:
+                row = f"  {icon}  {dev['name']}{batt_str}{trust_str}"
+            lv.append(ListItem(Label(row, markup=True)))
 
-        # ── bottom ──
-        stdscr.addstr(h - 4, 0, "├" + bar + "┤", curses.color_pair(3))
-        stdscr.addstr(h - 3, 1, (status_msg[:w-2]).ljust(w-2), curses.color_pair(status_color))
-        if scan_mode:
-            hints = "  ↑↓/jk navigate    ⏎ pair    esc back to devices    q quit"
+    def _status(self, msg):
+        self.query_one("#statusbar", Static).update(f"  {msg}")
+
+    # ── actions ──
+
+    @work(thread=True)
+    def action_refresh(self):
+        if self._scan_mode: return
+        self.call_from_thread(self._status, "[yellow]⠿  loading...[/yellow]")
+        try:
+            devs        = load_devices()
+            self._devices = devs
+            self._hsc   = hsc_battery()
+            self.call_from_thread(self._rebuild_list)
+            self.call_from_thread(self._refresh_header)
+            self.call_from_thread(self._status,
+                f"[green]✓  {len(devs)} device{'s' if len(devs) != 1 else ''}[/green]")
+        except Exception as e:
+            self.call_from_thread(self._status, f"[red]✗  {e}[/red]")
+
+    @work(thread=True)
+    def action_scan(self):
+        self._scan_mode = True
+        self.call_from_thread(self._rebuild_list)
+        self.call_from_thread(self._status, "[cyan]⠿  scanning 10s — put device in pairing mode...[/cyan]")
+        try:
+            found = scan_nearby(10)
+            self._scan_list = found
+            self.call_from_thread(self._rebuild_list)
+            self.call_from_thread(self._status,
+                f"[green]✓  {len(found)} nearby  [dim]([Enter] pair, [Esc] back)[/dim][/green]")
+        except Exception as e:
+            self.call_from_thread(self._status, f"[red]✗  {e}[/red]")
+
+    def action_connect(self):
+        lv   = self.query_one("#device-list", ListView)
+        idx  = lv.index
+        devs = self._current_list()
+        if idx is None or idx >= len(devs): return
+        dev  = devs[idx]
+        if self._scan_mode:
+            self._do_pair(dev["mac"], dev["name"])
+        elif dev["connected"]:
+            self._do_disconnect(dev["mac"], dev["name"])
         else:
-            hints = "  ↑↓/jk navigate    ⏎ connect/disconnect    p pair    x remove    t toggle    r refresh    s scan    q quit"
-        stdscr.addstr(h - 2, 0, hints[:w], curses.color_pair(5))
-        stdscr.addstr(h - 1, 0, "╰" + bar, curses.color_pair(3))
+            self._do_connect(dev["mac"], dev["name"])
 
-        stdscr.refresh()
+    @work(thread=True)
+    def _do_connect(self, mac, name):
+        self.call_from_thread(self._status, f"[yellow]connecting to {name}...[/yellow]")
+        ok = do_connect(mac)
+        if ok:
+            notify("Connected", f"Connected to {name}")
+            self.call_from_thread(self._status, f"[green]◉  connected: {name}[/green]")
+        else:
+            self.call_from_thread(self._status, f"[red]✗  failed: {name}[/red]")
+        devs = load_devices()
+        self._devices = devs
+        self._hsc = hsc_battery()
+        self.call_from_thread(self._rebuild_list)
+        self.call_from_thread(self._refresh_header)
 
-    # ── spinner helper ──
-    def run_with_spinner(target_fn, msg, color=8):
-        load_done.clear()
-        threading.Thread(target=target_fn, daemon=True).start()
-        spinner = ["⠋","⠙","⠹","⠸","⠼","⠴","⠦","⠧","⠇","⠏"]
-        si = 0
-        stdscr.nodelay(True)
-        while not load_done.is_set():
-            h, w = stdscr.getmaxyx()
-            stdscr.addstr(h - 3, 1,
-                f"  {spinner[si % len(spinner)]}  {msg}"[:w-2].ljust(w-2),
-                curses.color_pair(color))
-            stdscr.refresh()
-            si += 1
-            time.sleep(0.08)
-        stdscr.nodelay(False)
+    @work(thread=True)
+    def _do_disconnect(self, mac, name):
+        do_disconnect(mac)
+        notify("Disconnected", f"Disconnected from {name}", "low")
+        self.call_from_thread(self._status, f"[dim]○  disconnected: {name}[/dim]")
+        devs = load_devices()
+        self._devices = devs
+        self.call_from_thread(self._rebuild_list)
+        self.call_from_thread(self._refresh_header)
 
-    # ── event loop ──
-    while True:
-        draw()
-        key = stdscr.getch()
+    @work(thread=True)
+    def _do_pair(self, mac, name):
+        self.call_from_thread(self._status, f"[yellow]pairing {name}...[/yellow]")
+        ok = do_pair(mac)
+        if ok:
+            do_trust(mac)
+            do_connect(mac)
+            notify("Paired", f"Paired and connected: {name}")
+            self.call_from_thread(self._status, f"[green]◉  paired: {name}[/green]")
+            self._scan_mode = False
+            devs = load_devices()
+            self._devices = devs
+            self._hsc = hsc_battery()
+            self.call_from_thread(self._rebuild_list)
+            self.call_from_thread(self._refresh_header)
+        else:
+            self.call_from_thread(self._status,
+                f"[red]✗  pairing failed — is {name} in pairing mode?[/red]")
 
-        if key in (ord("q"), ord("Q")):
-            break
+    def action_audio_profile(self):
+        if self._scan_mode: return
+        lv   = self.query_one("#device-list", ListView)
+        idx  = lv.index
+        devs = self._current_list()
+        if idx is None or idx >= len(devs): return
+        dev  = devs[idx]
+        profiles, active, card = get_audio_profiles(dev["mac"])
+        if not profiles:
+            self._status("[yellow]no audio profiles found — is pactl installed?[/yellow]")
+            return
+        def handle(profile):
+            if profile is None: return
+            self._switch_profile(card, profile)
+        self.push_screen(AudioProfileModal(profiles, active), handle)
 
-        elif key == 27:   # esc
-            if scan_mode:
-                scan_mode = False
-                selected  = 0
-                status_msg, status_color = "  back to paired devices", 5
-            else:
-                break
+    @work(thread=True)
+    def _switch_profile(self, card, profile):
+        ok = set_audio_profile(card, profile)
+        color = "green" if ok else "red"
+        msg   = f"profile → {profile}" if ok else f"failed to switch to {profile}"
+        self.call_from_thread(self._status, f"[{color}]{msg}[/{color}]")
 
-        elif key in (curses.KEY_DOWN, ord("j")):
-            devlist = current_list()
-            if devlist:
-                selected = min(selected + 1, len(devlist) - 1)
+    def action_rename(self):
+        if self._scan_mode: return
+        lv   = self.query_one("#device-list", ListView)
+        idx  = lv.index
+        devs = self._current_list()
+        if idx is None or idx >= len(devs): return
+        dev  = devs[idx]
+        def handle(new_name):
+            if new_name and new_name != dev["name"]:
+                do_rename(dev["mac"], new_name)
+                self._status(f"[green]renamed to {new_name}[/green]")
+                self._devices = load_devices()
+                self.call_from_thread(self._rebuild_list)
+        self.push_screen(RenameModal(dev), handle)
 
-        elif key in (curses.KEY_UP, ord("k")):
-            devlist = current_list()
-            if devlist:
-                selected = max(selected - 1, 0)
+    @work(thread=True)
+    def action_trust_toggle(self):
+        if self._scan_mode: return
+        lv   = self.query_one("#device-list", ListView)
+        idx  = lv.index
+        devs = self._current_list()
+        if idx is None or idx >= len(devs): return
+        dev  = devs[idx]
+        if dev.get("trusted"):
+            do_untrust(dev["mac"])
+            self.call_from_thread(self._status,
+                f"[yellow]untrusted {dev['name']} — auto-connect off[/yellow]")
+        else:
+            do_trust(dev["mac"])
+            self.call_from_thread(self._status,
+                f"[green]trusted {dev['name']} — auto-connect on[/green]")
+        devs = load_devices()
+        self._devices = devs
+        self.call_from_thread(self._rebuild_list)
 
-        elif key in (ord("r"), ord("R")):
-            if scan_mode:
-                scan_mode = False
-                selected  = 0
-                status_msg, status_color = "  back to paired devices", 5
-            else:
-                run_with_spinner(do_refresh, "loading devices...")
-                selected = 0
+    @work(thread=True)
+    def action_remove(self):
+        if self._scan_mode: return
+        lv   = self.query_one("#device-list", ListView)
+        idx  = lv.index
+        devs = self._current_list()
+        if idx is None or idx >= len(devs): return
+        dev  = devs[idx]
+        do_remove(dev["mac"])
+        self.call_from_thread(self._status, f"[dim]removed {dev['name']}[/dim]")
+        devs = load_devices()
+        self._devices = devs
+        self.call_from_thread(self._rebuild_list)
 
-        elif key in (ord("s"), ord("S")):
-            if not scan_mode:
-                selected = 0
-                run_with_spinner(do_scan, "scanning for nearby devices...", 11)
+    @work(thread=True)
+    def action_toggle(self):
+        toggle_bt()
+        time.sleep(0.3)
+        on    = bt_powered()
+        color = "green" if on else "yellow"
+        state = "enabled" if on else "disabled"
+        self.call_from_thread(self._status, f"[{color}]bluetooth {state}[/{color}]")
+        self.call_from_thread(self._refresh_header)
 
-        elif key in (10, 13, curses.KEY_ENTER):
-            devlist = current_list()
-            if not devlist:
-                continue
-            dev = devlist[selected]
+    def action_back_or_quit(self):
+        if self._scan_mode:
+            self._scan_mode = False
+            self._rebuild_list()
+            self._status("[dim]back to paired devices[/dim]")
+        else:
+            self.exit()
 
-            if scan_mode:
-                # pair the selected discovered device
-                status_msg, status_color = f"  pairing {dev['name']}...", 8
-                draw()
-                ok = pair_device(dev["mac"])
-                if ok:
-                    trust_device(dev["mac"])
-                    connect_device(dev["mac"])
-                    status_msg, status_color = f"  ◉  paired and connected: {dev['name']}", 7
-                    scan_mode = False
-                    run_with_spinner(do_refresh, "refreshing...")
-                else:
-                    status_msg, status_color = f"  ✗  pairing failed — make sure device is in pairing mode", 9
-            else:
-                # toggle connect/disconnect
-                if dev["connected"]:
-                    status_msg, status_color = f"  disconnecting {dev['name']}...", 8
-                    draw()
-                    disconnect_device(dev["mac"])
-                    status_msg, status_color = f"  ○  disconnected: {dev['name']}", 7
-                    run_with_spinner(do_refresh, "refreshing...")
-                else:
-                    status_msg, status_color = f"  connecting {dev['name']}...", 8
-                    draw()
-                    ok = connect_device(dev["mac"])
-                    if ok:
-                        status_msg, status_color = f"  ◉  connected: {dev['name']}", 7
-                    else:
-                        status_msg, status_color = f"  ✗  failed to connect: {dev['name']}", 9
-                    run_with_spinner(do_refresh, "refreshing...")
+    def action_quit(self): self.exit()
 
-        elif key in (ord("p"), ord("P")):
-            if not scan_mode:
-                selected = 0
-                run_with_spinner(do_scan, "scanning for nearby devices...", 11)
+    @on(ListView.Selected)
+    def on_dev_selected(self, e): self.action_connect()
 
-        elif key in (ord("x"), ord("X")):
-            if not scan_mode:
-                devlist = current_list()
-                if not devlist:
-                    continue
-                dev = devlist[selected]
-                status_msg, status_color = f"  removing {dev['name']}...", 8
-                draw()
-                ok = remove_device(dev["mac"])
-                if ok:
-                    status_msg, status_color = f"  removed {dev['name']}", 7
-                    run_with_spinner(do_refresh, "refreshing...")
-                else:
-                    status_msg, status_color = f"  ✗  failed to remove {dev['name']}", 9
-
-        elif key in (ord("t"), ord("T")):
-            bt_toggle()
-            on = bt_powered()
-            status_msg, status_color = (
-                ("  bluetooth enabled", 7) if on else ("  bluetooth disabled", 8)
-            )
+    @on(ListView.Highlighted)
+    def on_dev_highlighted(self, e):
+        idx  = e.list_view.index
+        devs = self._current_list()
+        if idx is not None and idx < len(devs):
+            self._set_details(devs[idx])
+        else:
+            self._set_details(None)
 
 
 if __name__ == "__main__":
-    try:
-        curses.wrapper(main)
-    except KeyboardInterrupt:
-        pass
-    finally:
-        os.system("tput cnorm 2>/dev/null")
+    BtApp().run()
