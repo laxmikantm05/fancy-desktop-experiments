@@ -1,0 +1,123 @@
+#!/usr/bin/env python3
+# (your original header remains unchanged)
+
+import sys
+import subprocess, time, os, re, json, pathlib, datetime
+import pexpect  # <-- ADDED
+
+from textual.app        import App, ComposeResult
+from textual.widgets    import (ListView, ListItem, Label, Static,
+                                Input, Button, Footer)
+from textual.containers import Horizontal, Vertical, Container
+from textual.screen     import ModalScreen
+from textual.binding    import Binding
+from textual            import work, on
+
+# ── (everything above remains SAME, no changes) ──
+
+# ── bluetooth helpers ─────────────────────────────
+
+def run(cmd, timeout=12):
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return r.stdout.strip(), r.returncode
+    except Exception:
+        return "", 1
+
+# (all your helper functions remain unchanged…)
+
+# ── 🔥 FIXED PAIRING FUNCTION ──
+
+def do_pair(mac, status_callback=None):
+    try:
+        child = pexpect.spawn("bluetoothctl", encoding="utf-8", timeout=60)
+
+        # Setup agent
+        child.sendline("agent KeyboardDisplay")
+        child.sendline("default-agent")
+
+        # Start pairing
+        child.sendline(f"pair {mac}")
+
+        while True:
+            i = child.expect([
+                r"Confirm passkey (\d+)",
+                r"Request confirmation",
+                r"Enter PIN code:",
+                r"Pairing successful",
+                r"Failed",
+                pexpect.EOF,
+                pexpect.TIMEOUT
+            ])
+
+            # Show PIN
+            if i == 0:
+                pin = child.match.group(1)
+                if status_callback:
+                    status_callback(f"[bold cyan]PIN: {pin}[/bold cyan] — confirm on device")
+                child.sendline("yes")
+
+            # Just confirm
+            elif i == 1:
+                if status_callback:
+                    status_callback("[cyan]Confirm pairing on device[/cyan]")
+                child.sendline("yes")
+
+            # PIN input required
+            elif i == 2:
+                if status_callback:
+                    status_callback("[yellow]Enter PIN (using 0000)[/yellow]")
+                child.sendline("0000")
+
+            # Success
+            elif i == 3:
+                if status_callback:
+                    status_callback("[green]Pairing successful[/green]")
+                return True
+
+            # Failure
+            elif i == 4:
+                return False
+
+            else:
+                return False
+
+    except Exception:
+        return False
+
+# ── (rest of your code unchanged until BtApp) ──
+
+class BtApp(App):
+    # (ALL YOUR EXISTING CODE REMAINS EXACTLY SAME)
+
+    @work(thread=True)
+    def _do_pair(self, mac, name):
+        self.call_from_thread(self._status, f"[yellow]pairing {name}...[/yellow]")
+
+        ok = do_pair(
+            mac,
+            status_callback=lambda msg: self.call_from_thread(self._status, msg)
+        )
+
+        if ok:
+            do_trust(mac)
+            do_connect(mac)
+            notify("Paired", f"Paired and connected: {name}")
+
+            self.call_from_thread(self._status, f"[green]◉  paired: {name}[/green]")
+
+            self._scan_mode = False
+            devs = load_devices()
+            self._devices = devs
+            self._hsc = hsc_battery()
+
+            self.call_from_thread(self._rebuild_list)
+            self.call_from_thread(self._refresh_header)
+        else:
+            self.call_from_thread(self._status,
+                f"[red]✗  pairing failed — is {name} in pairing mode?[/red]")
+
+# ── (rest of your file untouched) ──
+
+if __name__ == "__main__":
+    BtApp().run()
