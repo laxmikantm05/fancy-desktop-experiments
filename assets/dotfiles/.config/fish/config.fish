@@ -9,7 +9,7 @@ if test -d ~/.local/bin
         set -p PATH ~/.local/bin
     end
 end
-set -g fish_ambiguous_width 1
+#set -g fish_ambiguous_width 1
 
 
 
@@ -116,6 +116,32 @@ function copy
     end
 end
 
+# ─────────────────────────────────────────
+# GUM AUTO COMPLETION
+# ─────────────────────────────────────────
+
+function fish_complete_with_fzf
+    set -l cmd (commandline -cp)
+    set -l comps (complete --do-complete "$cmd" 2>/dev/null)
+
+    if test (count $comps) -eq 0
+        commandline -f complete
+        return
+    end
+
+    set -l selected (printf '%s\n' $comps \
+        | fzf --height=12 --ansi \
+            --color="hl:#FF2D78,prompt:#00FFFF,pointer:#FF2D78" \
+            --prompt="▶ " \
+        | string split '\t')[1]
+
+    if test -n "$selected"
+        commandline -t $selected
+        commandline -f repaint
+    end
+end
+
+bind \t fish_complete_with_fzf
 
 
 
@@ -141,214 +167,10 @@ alias egrep='egrep --color=auto'
 alias hw='hwinfo --short'
 alias big="expac -H M '%m\t%n' | sort -h | nl"
 
-# ─────────────────────────────────────────
-#  CYBERPUNK POWER MENU
-#  deps: figlet, lolcat, gum
-# ─────────────────────────────────────────
-
-# ── DE detection (works on both legacy and modern Fedora GNOME sessions) ──
-function _is_gnome
-    string match -qi "*gnome*" "$XDG_CURRENT_DESKTOP"
-    or set -q GNOME_DESKTOP_SESSION_ID
-end
-
-function _do_lock
-    if _is_gnome
-        loginctl lock-session
-    else if set -q KDE_FULL_SESSION
-        loginctl lock-session
-    end
-end
-
-function _do_logout
-    if _is_gnome
-        gnome-session-quit --logout --no-prompt
-    else if set -q KDE_FULL_SESSION
-        qdbus org.kde.Logout /Logout logout 2>/dev/null
-        or loginctl terminate-session $XDG_SESSION_ID
-    end
-end
-
-# ── typing effect ──
-function _typewrite
-    set -l text $argv[1]
-    set -l color $argv[2]
-    printf "%b" $color
-    for i in (seq 1 (string length $text))
-        printf "%s" (string sub -s $i -l 1 $text)
-        sleep 0.03
-    end
-    printf "\033[0m\n"
-end
-
-# ── spinner ──
-function _spinner
-    set -l pid $argv[1]
-    set -l msg $argv[2]
-    set -l color $argv[3]
-    set -l frames '⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏'
-    while kill -0 $pid 2>/dev/null
-        for frame in $frames
-            printf "\r%b  %s  %s\033[0m" $color $frame $msg
-            sleep 0.08
-        end
-    end
-    printf "\r%b  ✓  %s\033[0m\n" $color $msg
-end
-
-# ── gum confirm ──
-function _confirm_action
-    set -l action $argv[1]
-    set -l cmd $argv[2]
-
-    printf "\n"
-    if gum confirm "  ⚠  confirm $action?" \
-        --prompt.foreground="#ff2d5a" \
-        --selected.background="#ff2d5a" \
-        --selected.foreground="#ffffff" \
-        --unselected.foreground="#888888"
-        eval $cmd
-    else
-        printf "\033[2m  cancelled.\033[0m\n\n"
-    end
-end
-
-# ── battery ──
-function _get_battery
-    set -l bat_path "/sys/class/power_supply/BAT0"
-    if not test -d $bat_path
-        set bat_path "/sys/class/power_supply/BAT1"
-    end
-    if test -d $bat_path
-        set -l cap (cat $bat_path/capacity 2>/dev/null)
-        set -l bat_status (cat $bat_path/status 2>/dev/null)
-        if test -n "$cap"
-            set -l icon "󰁹"
-            if test "$bat_status" = "Charging"
-                set icon "󰂄"
-            else if test "$cap" -lt 20
-                set icon "󰁺"
-            else if test "$cap" -lt 50
-                set icon "󰁽"
-            else if test "$cap" -lt 80
-                set icon "󰁿"
-            end
-            echo "$icon $cap%"
-        else
-            echo "󰁹 n/a"
-        end
-    else
-        echo "󰌁 ac"
-    end
-end
-
-# ── header ──
-function _print_header
-    # Use printf to build real ANSI escape sequences.
-    # Fish single-quoted strings are always literal — '\033' stays as 4 chars,
-    # never the ESC byte. printf '%b' or printf '\033[...]' gives the real byte.
-    set -l cyan  (printf '\033[38;5;51m')
-    set -l reset (printf '\033[0m')
-    set -l bold  (printf '\033[1m')
-    set -l dim   (printf '\033[2m')
-
-    set -l de ""
-    if _is_gnome
-        set de "gnome"
-    else if set -q KDE_FULL_SESSION
-        set de "kde"
-    end
-
-    set -l uptime_str (uptime -p | sed 's/up //')
-    set -l battery (_get_battery)
-
-    set -l font "$HOME/.local/share/figlet-fonts/delta_corps_priest_1.flf"
-    if not test -f $font
-        set font "standard"
-    end
-
-    printf "\n"
-    if command -q lolcat
-        figlet -f $font -w 80 "POWER" | lolcat --freq 0.3 --seed 42
-    else
-        figlet -f $font -w 80 "POWER" | while read -l line
-            printf "%s%s%s%s\n" $cyan $bold "$line" $reset
-        end
-    end
-
-    printf "\n"
-    printf "%s%s  ───────────────────────────────────────────────────%s\n" $dim $cyan $reset
-    printf "%s  %s · %s · %s%s\n" $dim "$de" "$USER" (date '+%A %d %b · %H:%M:%S') $reset
-    printf "%s  󰍜 uptime: %s  ·  %s%s\n" $dim "$uptime_str" "$battery" $reset
-    printf "%s%s  ───────────────────────────────────────────────────%s\n" $dim $cyan $reset
-    printf "\n"
-end
-
-# ── main menu ──
-function power
-    set -l dim   (printf '\033[2m')
-    set -l reset (printf '\033[0m')
-
-    clear
-    _print_header
-
-    # gum choose is the correct tool for a static selection menu.
-    # gum filter is a fuzzy-search tool — it renders ALL candidates + a live
-    # search box simultaneously, causing the broken duplicated-entry mess.
-    set -l chosen (gum choose \
-        "  󰌾  Lock" \
-        "  󰤄  Suspend" \
-        "  󰍃  Logout" \
-        "  󰜉  Reboot" \
-        "  󰐥  Shutdown" \
-        "  ✗  Cancel" \
-        --cursor="▶ " \
-        --cursor.foreground="#ff2d5a" \
-        --selected.foreground="#00eeff" \
-        --item.foreground="#888888" \
-        --header="  ⚡ ↑↓ navigate · enter to select · esc to quit" \
-        --header.foreground="#00eeff" \
-        --height=10)
-
-    switch "$chosen"
-        case "*Lock*"
-            _typewrite "  initiating lock sequence..." '\033[38;5;201m'
-            sleep 0.2 & _spinner $last_pid "locking session" '\033[38;5;201m'
-            _do_lock
-
-        case "*Suspend*"
-            _typewrite "  entering suspend mode..." '\033[38;5;39m'
-            sleep 0.5 & _spinner $last_pid "suspending" '\033[38;5;39m'
-            systemctl suspend
-
-        case "*Logout*"
-            _typewrite "  preparing to logout..." '\033[38;5;51m'
-            _confirm_action "logout" "_do_logout"
-
-        case "*Reboot*"
-            _typewrite "  system reboot requested..." '\033[38;5;226m'
-            _confirm_action "reboot" "systemctl reboot"
-
-        case "*Shutdown*"
-            _typewrite "  initiating shutdown sequence..." '\033[38;5;196m'
-            _confirm_action "shutdown" "systemctl poweroff"
-
-        case "*Cancel*"
-            printf "\n%s  aborted.%s\n\n" $dim $reset
-
-        case ""
-            printf "\n%s  aborted.%s\n\n" $dim $reset
-    end
-end
-
-# ── power aliases ──
-alias bye='power'
-alias zzz='systemctl suspend'
-alias lock='_do_lock'
-alias reboot!='_confirm_action reboot "systemctl reboot"'
-alias shutdown!='_confirm_action shutdown "systemctl poweroff"'
 
 
+# ── My Self Built Aliases ──
+alias bye='powermenu'
 
 
 
