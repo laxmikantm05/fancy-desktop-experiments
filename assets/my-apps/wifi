@@ -1,0 +1,645 @@
+#!/usr/bin/env python3
+"""
+wifi  --  nmcli wifi TUI  (urwid edition)
+install:  sudo cp wifi /usr/local/bin/ && sudo chmod +x /usr/local/bin/wifi
+deps:     pip install urwid --break-system-packages
+          nmcli (part of NetworkManager, usually pre-installed)
+"""
+import sys, os, subprocess, threading, time, shutil
+
+if "--help" in sys.argv:
+    print("""wifi  --  nmcli wifi TUI
+  /        scan / search     Enter  connect
+  d        disconnect        r      rescan
+  f        forget network    i      network info
+  Tab      cycle panels      q      quit
+"""); sys.exit(0)
+
+missing = []
+if not shutil.which("nmcli"):
+    missing.append("nmcli  (sudo dnf install NetworkManager / sudo apt install network-manager)")
+try:    import urwid
+except: missing.append("urwid  (pip install urwid --break-system-packages)")
+if missing:
+    print("\n  missing:\n" + "\n".join(f"    {m}" for m in missing)); sys.exit(1)
+
+import urwid
+
+# ─── palette (mirrors music app exactly) ──────────────────────────────────────
+PALETTE = [
+    ("default",       "default",      "default"),
+    ("dim",           "dark gray",    "default", "",  "g46",           "default"),
+    ("white",         "white",        "default", "",  "white",         "default"),
+    ("bold",          "white,bold",   "default", "bold", "white,bold", "default"),
+
+    ("red",           "dark red",     "default", "",  "#ff0033",       "default"),
+    ("red_bold",      "dark red,bold","default", "bold","#ff0033,bold","default"),
+    ("red_dim",       "dark red",     "default", "",  "#cc0022",       "default"),
+
+    ("focus",         "dark red,bold","default", "standout","#ff0033,bold","default"),
+    ("focus_info",    "dark red,bold","default", "standout","#ff0033,bold","default"),
+
+    ("active",        "dark red,bold","default", "bold","#ff0033,bold","default"),
+
+    ("bar_fill",      "dark red",     "default", "",  "#ff0033",       "default"),
+    ("bar_empty",     "dark gray",    "default", "",  "g23",           "default"),
+
+    ("input",         "white",        "default", "",  "white",         "default"),
+    ("input_focus",   "dark red",     "default", "",  "#ff0033",       "default"),
+
+    ("hint",          "dark gray",    "default", "",  "g35",           "default"),
+    ("col_hdr",       "dark gray",    "default", "",  "g46",           "default"),
+    ("border",        "dark red",     "default", "",  "#ff0033",       "default"),
+    ("title",         "dark red,bold","default", "bold","#ff0033,bold","default"),
+
+    ("good",          "dark green",   "default", "",  "#00cc44",       "default"),
+    ("warn",          "yellow,bold",  "default", "bold","#ffaa00,bold","default"),
+]
+
+# ─── nmcli helpers ────────────────────────────────────────────────────────────
+def _run(*args, timeout=10):
+    try:
+        r = subprocess.run(list(args), capture_output=True, text=True, timeout=timeout)
+        return r.stdout.strip(), r.returncode
+    except Exception as e:
+        return str(e), 1
+
+def signal_bars(strength):
+    """Return ▂▄▆█ bar visual + colour attr based on signal strength 0-100."""
+    s = int(strength or 0)
+    if   s >= 75: bar = "▂▄▆█"; attr = "good"
+    elif s >= 50: bar = "▂▄▆░"; attr = "good"
+    elif s >= 25: bar = "▂▄░░"; attr = "warn"
+    else:         bar = "▂░░░"; attr = "red_dim"
+    return bar, attr
+
+def get_networks():
+    """Return list of dicts from nmcli device wifi list."""
+    out, rc = _run("nmcli", "-t", "-f",
+                   "IN-USE,BSSID,SSID,MODE,CHAN,RATE,SIGNAL,BARS,SECURITY",
+                   "device", "wifi", "list")
+    if rc != 0:
+        return []
+    nets = []
+    seen = set()
+    for line in out.splitlines():
+        parts = line.split(":")
+        if len(parts) < 9:
+            continue
+        in_use   = parts[0].strip() == "*"
+        bssid    = parts[1].strip()
+        ssid     = parts[2].strip() or "<hidden>"
+        chan     = parts[4].strip()
+        rate     = parts[5].strip()
+        signal   = parts[6].strip()
+        security = parts[8].strip() or "open"
+
+        key = ssid
+        if key in seen and not in_use:
+            continue
+        seen.add(key)
+        nets.append({
+            "in_use":   in_use,
+            "bssid":    bssid,
+            "ssid":     ssid,
+            "chan":     chan,
+            "rate":     rate,
+            "signal":  signal,
+            "security": security,
+        })
+    nets.sort(key=lambda n: (-int(n["signal"] or 0), n["ssid"].lower()))
+    return nets
+
+def get_active_ssid():
+    out, _ = _run("nmcli", "-t", "-f", "ACTIVE,SSID", "device", "wifi")
+    for line in out.splitlines():
+        parts = line.split(":", 1)
+        if len(parts) == 2 and parts[0] == "yes":
+            return parts[1].strip()
+    return None
+
+def connect_network(ssid, password=None):
+    if password:
+        out, rc = _run("nmcli", "device", "wifi", "connect", ssid, "password", password, timeout=30)
+    else:
+        out, rc = _run("nmcli", "device", "wifi", "connect", ssid, timeout=30)
+    return rc == 0, out
+
+def disconnect_network():
+    out, rc = _run("nmcli", "device", "wifi", "disconnect", timeout=10)
+    return rc == 0, out
+
+def forget_network(ssid):
+    # Find connection name matching the SSID
+    out, _ = _run("nmcli", "-t", "-f", "NAME,TYPE", "connection", "show")
+    for line in out.splitlines():
+        parts = line.split(":", 1)
+        if len(parts) == 2 and parts[0] == ssid:
+            o2, rc = _run("nmcli", "connection", "delete", ssid)
+            return rc == 0, o2
+    return False, "no saved profile found"
+
+def rescan():
+    _run("nmcli", "device", "wifi", "rescan", timeout=5)
+
+def wifi_enabled():
+    out, _ = _run("nmcli", "radio", "wifi")
+    return "enabled" in out.lower()
+
+def toggle_wifi():
+    if wifi_enabled():
+        _run("nmcli", "radio", "wifi", "off")
+    else:
+        _run("nmcli", "radio", "wifi", "on")
+
+
+# ─── password dialog ──────────────────────────────────────────────────────────
+class PasswordDialog(urwid.WidgetWrap):
+    def __init__(self, ssid, on_connect, on_cancel):
+        self._ssid       = ssid
+        self._on_connect = on_connect
+        self._on_cancel  = on_cancel
+
+        self._edit = urwid.Edit(caption=("dim", "  password: "), mask="*")
+        edit_am    = urwid.AttrMap(self._edit, "input", "input_focus")
+
+        title = urwid.Text([("title", f" connect to "), ("white", ssid)])
+        div   = urwid.AttrMap(urwid.Divider("─"), "border")
+        hint  = urwid.Text(("hint", "  Enter  confirm   Esc  cancel"))
+
+        pile = urwid.Pile([title, div, edit_am, div, hint])
+        box  = urwid.LineBox(pile, tl_corner="┌", tr_corner="┐",
+                             bl_corner="└", br_corner="┘",
+                             left_side="│", right_side="│",
+                             top_line="─", bottom_line="─")
+        box_am = urwid.AttrMap(box, "border")
+        pad    = urwid.Padding(box_am, left=4, right=4)
+        filler = urwid.Filler(pad, valign="middle")
+        super().__init__(filler)
+
+    def keypress(self, size, key):
+        if key == "enter":
+            self._on_connect(self._ssid, self._edit.edit_text)
+            return None
+        if key == "esc":
+            self._on_cancel()
+            return None
+        return self._w.keypress(size, key)
+
+
+# ─── selectable row ───────────────────────────────────────────────────────────
+class SelectableRow(urwid.WidgetWrap):
+    def __init__(self, markup_normal, markup_focused=None, focus_map="focus"):
+        self._markup_normal  = markup_normal
+        self._markup_focused = markup_focused if markup_focused is not None else markup_normal
+        self._text   = urwid.Text(markup_normal, wrap="clip")
+        self._mapped = urwid.AttrMap(self._text, None, focus_map)
+        super().__init__(self._mapped)
+
+    def render(self, size, focus=False):
+        self._text.set_text(self._markup_focused if focus else self._markup_normal)
+        return super().render(size, focus)
+
+    def selectable(self): return True
+    def keypress(self, size, key): return key
+
+
+# ─── search edit ──────────────────────────────────────────────────────────────
+class SearchEdit(urwid.Edit):
+    def __init__(self, on_change, on_submit):
+        super().__init__(caption=("dim", "  filter: "))
+        self._on_change  = on_change
+        self._on_submit  = on_submit
+
+    def keypress(self, size, key):
+        if key == "enter":
+            self._on_submit(self.edit_text.strip())
+            return None
+        r = super().keypress(size, key)
+        self._on_change(self.edit_text)
+        return r
+
+
+# ─── main app ─────────────────────────────────────────────────────────────────
+class WifiApp:
+    def __init__(self):
+        self._nets      = []
+        self._filtered  = []
+        self._status    = "  scanning…"
+        self._active    = None
+        self._filter    = ""
+        self._focus     = "list"   # "list" | "info"
+        self._info_net  = None
+
+        # ── top bar ───────────────────────────────────────────────────────────
+        logo       = urwid.Text([("title", " WiFi"), ("dim", "  │")])
+        self._sedit = SearchEdit(on_change=self._on_filter, on_submit=self._on_filter_submit)
+        search_am  = urwid.AttrMap(self._sedit, "input", "input_focus")
+        self._wifi_toggle = urwid.Text(("dim", "  on "), align="right")
+
+        topbar = urwid.Columns([
+            ("fixed", 10, logo),
+            search_am,
+            ("fixed", 8, self._wifi_toggle),
+        ], dividechars=1)
+
+        top_div   = urwid.AttrMap(urwid.Divider("─"), "border")
+        top_block = urwid.Pile([topbar, top_div])
+
+        # ── column header ─────────────────────────────────────────────────────
+        self._col_hdr = urwid.Text(("col_hdr",
+            f"  {'ssid':<32}  {'signal':>6}  {'security':<12}  chan"))
+
+        # ── network list ──────────────────────────────────────────────────────
+        self._list_walker  = urwid.SimpleFocusListWalker([])
+        self._list_box     = urwid.ListBox(self._list_walker)
+        list_area          = urwid.Frame(self._list_box, header=self._col_hdr)
+
+        # ── info panel ────────────────────────────────────────────────────────
+        self._info_hdr  = urwid.Text(("col_hdr", "  details"))
+        self._info_body = urwid.SimpleFocusListWalker([])
+        self._info_box  = urwid.ListBox(self._info_body)
+        info_area       = urwid.Frame(self._info_box, header=self._info_hdr)
+
+        v_div = urwid.AttrMap(urwid.SolidFill("│"), "border")
+
+        body = urwid.Columns([
+            list_area,
+            ("fixed", 1,  v_div),
+            ("fixed", 30, info_area),
+        ], dividechars=0)
+
+        # ── footer ────────────────────────────────────────────────────────────
+        player_div    = urwid.AttrMap(urwid.Divider("─"), "border")
+        self._p_icon  = urwid.Text(("dim", "  ── "), align="left")
+        self._p_ssid  = urwid.Text(("dim", "  no connection"))
+        self._p_right = urwid.Text(("dim", ""), align="right")
+
+        row1 = urwid.Columns([
+            ("fixed", 5, self._p_icon),
+            self._p_ssid,
+            ("fixed", 18, self._p_right),
+        ])
+
+        self._p_bar    = urwid.Text(("bar_empty", "─" * 40))
+        self._p_status = urwid.Text(("hint", ""))
+
+        row2 = urwid.Columns([
+            ("fixed", 6, urwid.Text(("dim", "sig  "))),
+            self._p_bar,
+            ("fixed", 6, urwid.Text(("dim", ""), align="right")),
+        ])
+
+        hint1 = urwid.Text(("hint",
+            "  [/]  filter   [↵]  connect   [d]  disconnect   [r]  rescan"))
+        hint2 = urwid.Text(("hint",
+            "  [f]  forget   [i]  info      [w]  toggle wifi  [q]  quit"))
+
+        footer = urwid.Pile([
+            player_div,
+            row1,
+            row2,
+            self._p_status,
+            hint1,
+            hint2,
+        ])
+
+        self._frame = urwid.Frame(
+            body   = body,
+            header = top_block,
+            footer = footer,
+        )
+
+        screen = urwid.raw_display.Screen()
+        screen.set_terminal_properties(colors=256)
+
+        self._loop = urwid.MainLoop(
+            self._frame,
+            palette         = PALETTE,
+            screen          = screen,
+            unhandled_input = self._handle_key,
+        )
+        self._pipe = self._loop.watch_pipe(self._on_pipe)
+
+    # ── pipe / refresh ────────────────────────────────────────────────────────
+    def _signal(self):
+        try: os.write(self._pipe, b"r")
+        except: pass
+
+    def _on_pipe(self, _data):
+        self._rebuild_list()
+        self._rebuild_info()
+        self._draw_footer()
+
+    # ── filter ────────────────────────────────────────────────────────────────
+    def _on_filter(self, text):
+        self._filter = text.lower()
+        self._apply_filter()
+        self._rebuild_list()
+
+    def _on_filter_submit(self, text):
+        self._filter = text.lower()
+        self._apply_filter()
+        self._rebuild_list()
+        try:
+            self._frame.focus_position = "body"
+            self._frame.body.focus_position = 0
+            self._focus = "list"
+        except Exception: pass
+
+    def _apply_filter(self):
+        q = self._filter
+        self._filtered = [n for n in self._nets
+                          if q in n["ssid"].lower()] if q else list(self._nets)
+
+    # ── key handler ───────────────────────────────────────────────────────────
+    def _handle_key(self, key):
+        if key in ("/", "s"):
+            self._frame.focus_position = "header"
+            return
+
+        if key == "tab":
+            if self._focus == "list":
+                self._focus = "info"
+                try:
+                    self._frame.focus_position = "body"
+                    self._frame.body.focus_position = 2
+                except Exception: pass
+            else:
+                self._focus = "list"
+                try:
+                    self._frame.focus_position = "body"
+                    self._frame.body.focus_position = 0
+                except Exception: pass
+            return
+
+        if key == "enter":
+            if self._focus == "list":
+                self._try_connect()
+            return
+
+        k = key.lower() if isinstance(key, str) else key
+
+        if   k == "r": threading.Thread(target=self._do_rescan,      daemon=True).start()
+        elif k == "d": threading.Thread(target=self._do_disconnect,   daemon=True).start()
+        elif k == "f": threading.Thread(target=self._do_forget,       daemon=True).start()
+        elif k == "i": self._show_info()
+        elif k == "w": threading.Thread(target=self._do_toggle_wifi,  daemon=True).start()
+        elif k == "q": raise urwid.ExitMainLoop()
+
+    # ── connect ───────────────────────────────────────────────────────────────
+    def _try_connect(self):
+        net = self._focused_net()
+        if not net:
+            return
+        ssid = net["ssid"]
+        if net["in_use"]:
+            self._status = f"  already connected to {ssid}"
+            self._draw_footer()
+            return
+        sec = net["security"].lower()
+        needs_pw = any(x in sec for x in ("wpa", "wep", "802.1x")) and "open" not in sec
+
+        if needs_pw:
+            # Show password overlay
+            dlg = PasswordDialog(
+                ssid,
+                on_connect = self._do_connect,
+                on_cancel  = self._cancel_dialog,
+            )
+            self._loop.widget = dlg
+        else:
+            self._status = f"  connecting to {ssid}…"
+            self._draw_footer()
+            threading.Thread(target=self._do_connect, args=(ssid, None), daemon=True).start()
+
+    def _cancel_dialog(self):
+        self._loop.widget = self._frame
+
+    def _do_connect(self, ssid, password):
+        self._loop.widget = self._frame
+        self._status = f"  connecting to {ssid}…"
+        self._signal()
+        ok, msg = connect_network(ssid, password)
+        self._active = get_active_ssid()
+        if ok:
+            self._status = f"  connected: {ssid}"
+        else:
+            first_line = (msg or "failed").splitlines()[0][:60]
+            self._status = f"  failed: {first_line}"
+        threading.Thread(target=self._bg_refresh, daemon=True).start()
+
+    # ── disconnect ────────────────────────────────────────────────────────────
+    def _do_disconnect(self):
+        self._status = "  disconnecting…"; self._signal()
+        ok, _ = disconnect_network()
+        self._active = get_active_ssid()
+        self._status = "  disconnected" if ok else "  disconnect failed"
+        threading.Thread(target=self._bg_refresh, daemon=True).start()
+
+    # ── forget ────────────────────────────────────────────────────────────────
+    def _do_forget(self):
+        net = self._focused_net()
+        if not net: return
+        self._status = f"  forgetting {net['ssid']}…"; self._signal()
+        ok, msg = forget_network(net["ssid"])
+        self._status = f"  forgotten: {net['ssid']}" if ok else f"  {msg[:50]}"
+        threading.Thread(target=self._bg_refresh, daemon=True).start()
+
+    # ── rescan ────────────────────────────────────────────────────────────────
+    def _do_rescan(self):
+        self._status = "  rescanning…"; self._signal()
+        rescan(); time.sleep(2)
+        self._bg_refresh()
+
+    # ── toggle wifi ───────────────────────────────────────────────────────────
+    def _do_toggle_wifi(self):
+        toggle_wifi(); time.sleep(1)
+        enabled = wifi_enabled()
+        self._status = f"  wifi {'enabled' if enabled else 'disabled'}"
+        self._bg_refresh()
+
+    # ── info panel ────────────────────────────────────────────────────────────
+    def _show_info(self):
+        net = self._focused_net()
+        if not net: return
+        self._info_net = net
+        self._rebuild_info()
+        # Shift focus to info panel
+        self._focus = "info"
+        try:
+            self._frame.focus_position = "body"
+            self._frame.body.focus_position = 2
+        except Exception: pass
+
+    def _rebuild_info(self):
+        net = self._info_net
+        n   = len(self._filtered)
+        self._info_hdr.set_text([
+            ("col_hdr", "  details"),
+            ("dim",     f"  ({n} nets)"),
+        ])
+
+        rows = []
+        if not net:
+            rows.append(SelectableRow(
+                [("dim", "  press [i] for details")],
+                focus_map="focus_info"
+            ))
+        else:
+            bars, battr = signal_bars(net["signal"])
+            items = [
+                ("ssid",     net["ssid"]),
+                ("bssid",    net["bssid"]),
+                ("signal",   f"{net['signal']}%  {bars}"),
+                ("security", net["security"] or "open"),
+                ("channel",  net["chan"]),
+                ("rate",     net["rate"]),
+                ("status",   "connected ▶" if net["in_use"] else "not connected"),
+            ]
+            for k, v in items:
+                markup_n = [
+                    ("dim",   f"  {k:<10}"),
+                    ("white", f"  {v}"),
+                ]
+                markup_f = [
+                    ("red",   f" »{k:<10}"),
+                    ("white", f"  {v}"),
+                ]
+                rows.append(SelectableRow(markup_n, markup_focused=markup_f, focus_map="focus_info"))
+
+        try:    old = self._info_box.focus_position
+        except: old = 0
+        self._info_body[:] = rows
+        if rows:
+            try: self._info_box.set_focus(min(old, len(rows)-1))
+            except Exception: pass
+
+    # ── background refresh ────────────────────────────────────────────────────
+    def _bg_refresh(self):
+        self._nets   = get_networks()
+        self._active = get_active_ssid()
+        self._apply_filter()
+        self._signal()
+
+    # ── focused net ───────────────────────────────────────────────────────────
+    def _focused_net(self):
+        try:
+            idx = self._list_box.focus_position
+            if 0 <= idx < len(self._filtered):
+                return self._filtered[idx]
+        except Exception: pass
+        return None
+
+    # ── list rebuild ──────────────────────────────────────────────────────────
+    def _rebuild_list(self):
+        n = len(self._filtered)
+        enabled = wifi_enabled()
+        self._wifi_toggle.set_text(
+            ("good", "  on  ") if enabled else ("red_dim", "  off ")
+        )
+        self._col_hdr.set_text([
+            ("col_hdr", f"  {'ssid':<32}  {'signal':>6}  {'security':<12}  chan"),
+            ("dim",     f"   [{n}]"),
+        ])
+
+        rows = []
+        for net in self._filtered:
+            bars, battr = signal_bars(net["signal"])
+            ssid     = net["ssid"][:32]
+            security = net["security"][:12] if net["security"] else "open"
+            chan     = net["chan"][:4]
+            sig_str  = f"{net['signal']:>3}%"
+            active   = net["in_use"]
+
+            if active:
+                markup_n = [
+                    ("red_bold", "  ▶  "),
+                    ("active",   f"{ssid:<32}"),
+                    ("dim",      f"  {sig_str} "),
+                    (battr,      bars),
+                    ("dim",      f"  {security:<12}  {chan}"),
+                ]
+                markup_f = [
+                    ("red_bold", " »▶  "),
+                    ("active",   f"{ssid:<32}"),
+                    ("dim",      f"  {sig_str} "),
+                    (battr,      bars),
+                    ("dim",      f"  {security:<12}  {chan}"),
+                ]
+            else:
+                markup_n = [
+                    ("dim",   "     "),
+                    ("white", f"{ssid:<32}"),
+                    ("dim",   f"  {sig_str} "),
+                    (battr,   bars),
+                    ("dim",   f"  {security:<12}  {chan}"),
+                ]
+                markup_f = [
+                    ("red",   "  »  "),
+                    ("white", f"{ssid:<32}"),
+                    ("dim",   f"  {sig_str} "),
+                    (battr,   bars),
+                    ("dim",   f"  {security:<12}  {chan}"),
+                ]
+            rows.append(SelectableRow(markup_n, markup_focused=markup_f, focus_map="focus"))
+
+        try:    old = self._list_box.focus_position
+        except: old = 0
+        self._list_walker[:] = rows
+        if rows:
+            try: self._list_box.set_focus(min(old, len(rows)-1))
+            except Exception: pass
+
+    # ── footer draw ───────────────────────────────────────────────────────────
+    def _draw_footer(self):
+        active = self._active
+        if active:
+            # Find the active net for signal
+            net = next((n for n in self._nets if n["in_use"]), None)
+            self._p_icon.set_text(("red_bold", "  ▶ "))
+            self._p_ssid.set_text([
+                ("bold", f" {active}"),
+            ])
+            if net:
+                bars, battr = signal_bars(net["signal"])
+                sig = int(net["signal"] or 0)
+                W   = 40
+                filled = int((sig / 100) * W)
+                empty  = W - filled
+                parts  = []
+                if filled: parts.append(("bar_fill",  "━" * filled))
+                if empty:  parts.append(("bar_empty", "─" * empty))
+                self._p_bar.set_text(parts)
+                self._p_right.set_text(("dim", f"{net['signal']}% {bars}"))
+            else:
+                self._p_bar.set_text(("bar_empty", "─" * 40))
+        else:
+            self._p_icon.set_text(("dim", "  ── "))
+            self._p_ssid.set_text(("dim", "  no connection"))
+            self._p_bar.set_text(("bar_empty", "─" * 40))
+            self._p_right.set_text(("dim", ""))
+
+        self._p_status.set_text(("hint", f"  {self._status.strip()}"))
+
+    # ── tick ──────────────────────────────────────────────────────────────────
+    def _tick(self, loop, _data):
+        self._draw_footer()
+        self._loop.set_alarm_in(5, self._tick)
+
+    # ── run ───────────────────────────────────────────────────────────────────
+    def run(self):
+        # Initial load in background
+        threading.Thread(target=self._bg_refresh, daemon=True).start()
+        self._rebuild_list()
+        self._rebuild_info()
+        self._draw_footer()
+        self._loop.set_alarm_in(5, self._tick)
+        try:
+            self._loop.run()
+        except KeyboardInterrupt:
+            pass
+
+
+if __name__ == "__main__":
+    WifiApp().run()

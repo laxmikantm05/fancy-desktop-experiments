@@ -1,0 +1,1011 @@
+#!/usr/bin/env python3
+"""
+bt  --  bluetoothctl TUI  (urwid edition)
+install:  sudo cp bt /usr/local/bin/ && sudo chmod +x /usr/local/bin/bt
+deps:     pip install urwid pexpect --break-system-packages
+          bluetoothctl (part of bluez, usually pre-installed)
+"""
+import sys, os, subprocess, threading, time, shutil, re
+
+if "--help" in sys.argv:
+    print("""bt  --  bluetoothctl TUI
+  /        filter devices    Enter  connect / pair
+  d        disconnect        r      rescan (30s)
+  t        trust device      u      untrust
+  x        remove device     i      device info
+  Tab      cycle panels      q      quit
+"""); sys.exit(0)
+
+missing = []
+if not shutil.which("bluetoothctl"):
+    missing.append("bluetoothctl  (sudo dnf install bluez / sudo apt install bluez)")
+try:    import urwid
+except: missing.append("urwid  (pip install urwid --break-system-packages)")
+try:    import pexpect
+except: missing.append("pexpect  (pip install pexpect --break-system-packages)")
+if missing:
+    print("\n  missing:\n" + "\n".join(f"    {m}" for m in missing)); sys.exit(1)
+
+import urwid
+import pexpect
+
+# ─── palette ──────────────────────────────────────────────────────────────────
+PALETTE = [
+    ("default",       "default",      "default"),
+    ("dim",           "dark gray",    "default", "",  "g46",           "default"),
+    ("white",         "white",        "default", "",  "white",         "default"),
+    ("bold",          "white,bold",   "default", "bold", "white,bold", "default"),
+
+    ("red",           "dark red",     "default", "",  "#ff0033",       "default"),
+    ("red_bold",      "dark red,bold","default", "bold","#ff0033,bold","default"),
+    ("red_dim",       "dark red",     "default", "",  "#cc0022",       "default"),
+
+    ("focus",         "dark red,bold","default", "standout","#ff0033,bold","default"),
+    ("focus_info",    "dark red,bold","default", "standout","#ff0033,bold","default"),
+
+    ("active",        "dark red,bold","default", "bold","#ff0033,bold","default"),
+
+    ("bar_fill",      "dark red",     "default", "",  "#ff0033",       "default"),
+    ("bar_empty",     "dark gray",    "default", "",  "g23",           "default"),
+
+    ("input",         "white",        "default", "",  "white",         "default"),
+    ("input_focus",   "dark red",     "default", "",  "#ff0033",       "default"),
+
+    ("hint",          "dark gray",    "default", "",  "g35",           "default"),
+    ("col_hdr",       "dark gray",    "default", "",  "g46",           "default"),
+    ("border",        "dark red",     "default", "",  "#ff0033",       "default"),
+    ("title",         "dark red,bold","default", "bold","#ff0033,bold","default"),
+
+    ("good",          "dark green",   "default", "",  "#00cc44",       "default"),
+    ("warn",          "yellow,bold",  "default", "bold","#ffaa00,bold","default"),
+    ("paired",        "dark cyan",    "default", "",  "#00aacc",       "default"),
+
+    ("code",          "yellow,bold",  "default", "bold","#ffcc00,bold","default"),
+]
+
+# ─── bluetoothctl helpers ─────────────────────────────────────────────────────
+def _run(*args, timeout=10):
+    try:
+        r = subprocess.run(list(args), capture_output=True, text=True, timeout=timeout)
+        return r.stdout.strip(), r.returncode
+    except Exception as e:
+        return str(e), 1
+
+def _btctl(*cmds, timeout=15):
+    """Send commands to bluetoothctl via echo pipe."""
+    joined = "\n".join(cmds)
+    try:
+        r = subprocess.run(
+            ["bluetoothctl"],
+            input=joined + "\n",
+            capture_output=True, text=True, timeout=timeout
+        )
+        return r.stdout + r.stderr, r.returncode
+    except Exception as e:
+        return str(e), 1
+
+def bt_enabled():
+    out, _ = _run("bluetoothctl", "show")
+    for line in out.splitlines():
+        if "Powered:" in line:
+            return "yes" in line.lower()
+    return False
+
+def toggle_bt():
+    if bt_enabled():
+        _btctl("power off")
+    else:
+        _btctl("power on")
+
+def get_devices():
+    """Return paired + cached devices, annotated with connection status."""
+    devices = {}
+
+    out, _ = _run("bluetoothctl", "devices", "Paired")
+    for line in out.splitlines():
+        m = re.match(r"Device ([0-9A-F:]+)\s+(.+)", line.strip(), re.IGNORECASE)
+        if m:
+            mac, name = m.group(1).upper(), m.group(2).strip()
+            devices[mac] = {"mac": mac, "name": name, "paired": True,
+                            "connected": False, "trusted": False, "rssi": ""}
+
+    out, _ = _run("bluetoothctl", "devices")
+    for line in out.splitlines():
+        m = re.match(r"Device ([0-9A-F:]+)\s+(.+)", line.strip(), re.IGNORECASE)
+        if m:
+            mac, name = m.group(1).upper(), m.group(2).strip()
+            if mac not in devices:
+                devices[mac] = {"mac": mac, "name": name, "paired": False,
+                                "connected": False, "trusted": False, "rssi": ""}
+
+    for mac, dev in list(devices.items()):
+        out, _ = _run("bluetoothctl", "info", mac)
+        for line in out.splitlines():
+            l = line.strip()
+            if l.startswith("Connected:"):
+                dev["connected"] = "yes" in l.lower()
+            elif l.startswith("Trusted:"):
+                dev["trusted"] = "yes" in l.lower()
+            elif l.startswith("RSSI:"):
+                dev["rssi"] = l.split(":", 1)[-1].strip()
+            elif l.startswith("Alias:") and not dev["name"]:
+                dev["name"] = l.split(":", 1)[-1].strip()
+
+    result = sorted(devices.values(),
+                    key=lambda d: (not d["connected"], not d["paired"], d["name"].lower()))
+    return result
+
+def start_scan():
+    def _scan():
+        _btctl("scan on", timeout=32)
+        _btctl("scan off")
+    threading.Thread(target=_scan, daemon=True).start()
+
+def connect_device(mac):
+    out, rc = _btctl(f"connect {mac}", timeout=20)
+    return rc == 0 or "successful" in out.lower(), out
+
+def disconnect_device(mac):
+    out, rc = _btctl(f"disconnect {mac}", timeout=10)
+    return rc == 0 or "successful" in out.lower(), out
+
+def trust_device(mac):
+    out, rc = _btctl(f"trust {mac}", timeout=10)
+    return rc == 0, out
+
+def untrust_device(mac):
+    out, rc = _btctl(f"untrust {mac}", timeout=10)
+    return rc == 0, out
+
+def remove_device(mac):
+    out, rc = _btctl(f"remove {mac}", timeout=10)
+    return rc == 0, out
+
+
+# ─── interactive pairing via pexpect ──────────────────────────────────────────
+# Pairing agent events — sent from background thread to UI thread via pipe
+class PairEvent:
+    """Base class for pairing events."""
+
+class PairConfirmEvent(PairEvent):
+    """Device asks: confirm passkey XXXXXX (yes/no)?"""
+    def __init__(self, passkey): self.passkey = passkey
+
+class PairPinEvent(PairEvent):
+    """Device asks: enter PIN code."""
+
+class PairDoneEvent(PairEvent):
+    """Pairing finished."""
+    def __init__(self, ok, msg):
+        self.ok  = ok
+        self.msg = msg
+
+
+def pair_interactive(mac, on_event, timeout=40):
+    """
+    Spawn bluetoothctl interactively, drive pairing, and call on_event()
+    for each UI-relevant event.
+
+    on_event is called from the background thread — callers must be
+    thread-safe (write to a pipe, never touch urwid widgets directly).
+    """
+    try:
+        child = pexpect.spawn("bluetoothctl", encoding="utf-8",
+                              timeout=timeout, echo=False)
+        child.expect(r"\[bluetooth\].*#", timeout=10)
+
+        child.sendline(f"pair {mac}")
+
+        patterns = [
+            r"Confirm passkey (\d+)",          # 0 – SSP confirm
+            r"\[agent\] Confirm passkey (\d+)", # 1 – SSP confirm (alt fmt)
+            r"\[agent\] Enter.*[Pp][Ii][Nn]",   # 2 – legacy PIN request
+            r"Pairing successful",              # 3 – success
+            r"Failed to pair",                  # 4 – failure
+            r"already paired",                  # 5 – already done
+            pexpect.EOF,                        # 6
+            pexpect.TIMEOUT,                    # 7
+        ]
+
+        while True:
+            idx = child.expect(patterns, timeout=timeout)
+
+            if idx in (0, 1):
+                passkey = child.match.group(1)
+                on_event(PairConfirmEvent(passkey))
+                # Wait for the UI to call child.sendline("yes") or ("no")
+                # We block here; the UI thread sends via child reference
+                # returned from this call — so we expose child.
+                # Actually: we wait for the next prompt after the UI responds.
+                idx2 = child.expect([
+                    r"Pairing successful",
+                    r"Failed to pair",
+                    pexpect.EOF,
+                    pexpect.TIMEOUT,
+                ], timeout=timeout)
+                ok  = idx2 == 0
+                msg = "paired successfully" if ok else "pairing failed"
+                on_event(PairDoneEvent(ok, msg))
+                break
+
+            elif idx == 2:
+                on_event(PairPinEvent())
+                idx2 = child.expect([
+                    r"Pairing successful",
+                    r"Failed to pair",
+                    pexpect.EOF,
+                    pexpect.TIMEOUT,
+                ], timeout=timeout)
+                ok  = idx2 == 0
+                msg = "paired successfully" if ok else "pairing failed"
+                on_event(PairDoneEvent(ok, msg))
+                break
+
+            elif idx == 3:
+                on_event(PairDoneEvent(True,  "paired successfully"))
+                break
+
+            elif idx in (4, 6, 7):
+                on_event(PairDoneEvent(False, "pairing failed"))
+                break
+
+            elif idx == 5:
+                on_event(PairDoneEvent(True, "already paired"))
+                break
+
+        try:
+            child.sendline("quit")
+            child.close()
+        except Exception:
+            pass
+
+        return child   # caller doesn't usually need this
+
+    except Exception as e:
+        on_event(PairDoneEvent(False, str(e)[:60]))
+
+
+# ─── pairing dialogs ──────────────────────────────────────────────────────────
+
+class ConfirmDialog(urwid.WidgetWrap):
+    """Show a passkey and ask the user to confirm yes/no."""
+    def __init__(self, device_name, passkey, on_yes, on_no):
+        self._on_yes = on_yes
+        self._on_no  = on_no
+
+        title   = urwid.Text([("title", " pair "), ("white", device_name)])
+        div     = urwid.AttrMap(urwid.Divider("─"), "border")
+
+        label   = urwid.Text(("dim",  "  confirm this passkey on both devices:"))
+        code    = urwid.Text(("code", f"  {passkey}"), align="center")
+        spacer  = urwid.Text("")
+
+        btn_yes = urwid.Button("  Yes — confirm  ")
+        btn_no  = urwid.Button("  No  — reject   ")
+        urwid.connect_signal(btn_yes, "click", lambda _: self._on_yes())
+        urwid.connect_signal(btn_no,  "click", lambda _: self._on_no())
+        btn_yes_am = urwid.AttrMap(btn_yes, "input", "focus")
+        btn_no_am  = urwid.AttrMap(btn_no,  "input", "focus")
+
+        hint = urwid.Text(("hint", "  Enter/Y  confirm   N/Esc  reject"))
+
+        pile = urwid.Pile([
+            title, div, spacer,
+            label, spacer, code, spacer,
+            btn_yes_am, btn_no_am,
+            div, hint,
+        ])
+        pile.focus_position = 7   # start focus on Yes button
+
+        box    = urwid.LineBox(pile, tl_corner="┌", tr_corner="┐",
+                               bl_corner="└", br_corner="┘",
+                               left_side="│", right_side="│",
+                               top_line="─", bottom_line="─")
+        box_am = urwid.AttrMap(box, "border")
+        pad    = urwid.Padding(box_am, left=6, right=6)
+        filler = urwid.Filler(pad, valign="middle")
+        super().__init__(filler)
+
+    def keypress(self, size, key):
+        if key in ("y", "Y", "enter"):
+            self._on_yes(); return None
+        if key in ("n", "N", "esc"):
+            self._on_no();  return None
+        return self._w.keypress(size, key)
+
+
+class PinDialog(urwid.WidgetWrap):
+    """Prompt the user to type a legacy PIN."""
+    def __init__(self, device_name, on_submit, on_cancel):
+        self._on_submit = on_submit
+        self._on_cancel = on_cancel
+
+        self._edit = urwid.Edit(caption=("dim", "  PIN: "))
+        edit_am    = urwid.AttrMap(self._edit, "input", "input_focus")
+
+        title  = urwid.Text([("title", " pair "), ("white", device_name)])
+        div    = urwid.AttrMap(urwid.Divider("─"), "border")
+        label  = urwid.Text(("dim", "  enter the PIN shown on the device:"))
+        spacer = urwid.Text("")
+        hint   = urwid.Text(("hint", "  Enter  confirm   Esc  cancel"))
+
+        pile = urwid.Pile([title, div, label, spacer, edit_am, div, hint])
+        box  = urwid.LineBox(pile, tl_corner="┌", tr_corner="┐",
+                             bl_corner="└", br_corner="┘",
+                             left_side="│", right_side="│",
+                             top_line="─", bottom_line="─")
+        box_am = urwid.AttrMap(box, "border")
+        pad    = urwid.Padding(box_am, left=6, right=6)
+        filler = urwid.Filler(pad, valign="middle")
+        super().__init__(filler)
+
+    def keypress(self, size, key):
+        if key == "enter":
+            self._on_submit(self._edit.edit_text.strip()); return None
+        if key == "esc":
+            self._on_cancel(); return None
+        return self._w.keypress(size, key)
+
+
+# ─── selectable row ───────────────────────────────────────────────────────────
+class SelectableRow(urwid.WidgetWrap):
+    def __init__(self, markup_normal, markup_focused=None, focus_map="focus"):
+        self._markup_normal  = markup_normal
+        self._markup_focused = markup_focused if markup_focused is not None else markup_normal
+        self._text   = urwid.Text(markup_normal, wrap="clip")
+        self._mapped = urwid.AttrMap(self._text, None, focus_map)
+        super().__init__(self._mapped)
+
+    def render(self, size, focus=False):
+        self._text.set_text(self._markup_focused if focus else self._markup_normal)
+        return super().render(size, focus)
+
+    def selectable(self): return True
+    def keypress(self, size, key): return key
+
+
+# ─── search edit ──────────────────────────────────────────────────────────────
+class SearchEdit(urwid.Edit):
+    def __init__(self, on_change, on_submit):
+        super().__init__(caption=("dim", "  filter: "))
+        self._on_change  = on_change
+        self._on_submit  = on_submit
+
+    def keypress(self, size, key):
+        if key == "enter":
+            self._on_submit(self.edit_text.strip())
+            return None
+        r = super().keypress(size, key)
+        self._on_change(self.edit_text)
+        return r
+
+
+# ─── main app ─────────────────────────────────────────────────────────────────
+class BTApp:
+    def __init__(self):
+        self._devices    = []
+        self._filtered   = []
+        self._status     = "  loading…"
+        self._filter     = ""
+        self._focus      = "list"
+        self._info_dev   = None
+        self._scanning   = False
+
+        # Active pexpect child during pairing (shared between threads)
+        self._pair_child = None
+
+        # ── top bar ───────────────────────────────────────────────────────────
+        logo        = urwid.Text([("title", " Bluetooth"), ("dim", "  │")])
+        self._sedit = SearchEdit(on_change=self._on_filter, on_submit=self._on_filter_submit)
+        search_am   = urwid.AttrMap(self._sedit, "input", "input_focus")
+        self._bt_toggle = urwid.Text(("dim", "  on "), align="right")
+
+        topbar = urwid.Columns([
+            ("fixed", 14, logo),
+            search_am,
+            ("fixed", 8, self._bt_toggle),
+        ], dividechars=1)
+
+        top_div   = urwid.AttrMap(urwid.Divider("─"), "border")
+        top_block = urwid.Pile([topbar, top_div])
+
+        # ── column header ─────────────────────────────────────────────────────
+        self._col_hdr = urwid.Text(("col_hdr",
+            f"  {'name':<32}  {'mac':<20}  paired  trusted"))
+
+        # ── device list ───────────────────────────────────────────────────────
+        self._list_walker = urwid.SimpleFocusListWalker([])
+        self._list_box    = urwid.ListBox(self._list_walker)
+        list_area         = urwid.Frame(self._list_box, header=self._col_hdr)
+
+        # ── info panel ────────────────────────────────────────────────────────
+        self._info_hdr  = urwid.Text(("col_hdr", "  details"))
+        self._info_body = urwid.SimpleFocusListWalker([])
+        self._info_box  = urwid.ListBox(self._info_body)
+        info_area       = urwid.Frame(self._info_box, header=self._info_hdr)
+
+        v_div = urwid.AttrMap(urwid.SolidFill("│"), "border")
+
+        body = urwid.Columns([
+            list_area,
+            ("fixed", 1,  v_div),
+            ("fixed", 30, info_area),
+        ], dividechars=0)
+
+        # ── footer ────────────────────────────────────────────────────────────
+        player_div    = urwid.AttrMap(urwid.Divider("─"), "border")
+        self._p_icon  = urwid.Text(("dim", "  ── "), align="left")
+        self._p_name  = urwid.Text(("dim", "  no connection"))
+        self._p_right = urwid.Text(("dim", ""), align="right")
+
+        row1 = urwid.Columns([
+            ("fixed", 5, self._p_icon),
+            self._p_name,
+            ("fixed", 18, self._p_right),
+        ])
+
+        self._p_bar    = urwid.Text(("bar_empty", "─" * 40))
+        self._p_status = urwid.Text(("hint", ""))
+
+        row2 = urwid.Columns([
+            ("fixed", 6, urwid.Text(("dim", "rssi "))),
+            self._p_bar,
+        ])
+
+        hint1 = urwid.Text(("hint",
+            "  [/]  filter   [↵]  connect/pair   [d]  disconnect   [r]  scan"))
+        hint2 = urwid.Text(("hint",
+            "  [t]  trust    [u]  untrust        [x]  remove       [q]  quit"))
+
+        footer = urwid.Pile([
+            player_div,
+            row1,
+            row2,
+            self._p_status,
+            hint1,
+            hint2,
+        ])
+
+        self._frame = urwid.Frame(
+            body   = body,
+            header = top_block,
+            footer = footer,
+        )
+
+        screen = urwid.raw_display.Screen()
+        screen.set_terminal_properties(colors=256)
+
+        self._loop = urwid.MainLoop(
+            self._frame,
+            palette         = PALETTE,
+            screen          = screen,
+            unhandled_input = self._handle_key,
+        )
+        self._pipe = self._loop.watch_pipe(self._on_pipe)
+
+        # Secondary pipe used by the pairing thread to push dialog events
+        self._pair_event = None
+        self._pair_pipe  = self._loop.watch_pipe(self._on_pair_pipe)
+
+    # ── pipe / refresh ────────────────────────────────────────────────────────
+    def _signal(self):
+        try: os.write(self._pipe, b"r")
+        except: pass
+
+    def _on_pipe(self, _data):
+        self._rebuild_list()
+        self._rebuild_info()
+        self._draw_footer()
+
+    # ── pairing pipe (background → UI) ───────────────────────────────────────
+    def _push_pair_event(self, event):
+        """Called from background thread — safe: just writes a byte."""
+        self._pair_event = event
+        try: os.write(self._pair_pipe, b"p")
+        except: pass
+
+    def _on_pair_pipe(self, _data):
+        """Called in the urwid main thread."""
+        ev = self._pair_event
+        if ev is None:
+            return
+
+        dev = self._pairing_dev  # set before thread started
+
+        if isinstance(ev, PairConfirmEvent):
+            self._status = f"  confirm passkey for {dev['name']}…"
+            self._draw_footer()
+            dlg = ConfirmDialog(
+                device_name = dev["name"],
+                passkey     = ev.passkey,
+                on_yes      = self._pair_confirm_yes,
+                on_no       = self._pair_confirm_no,
+            )
+            self._loop.widget = dlg
+
+        elif isinstance(ev, PairPinEvent):
+            self._status = f"  PIN required for {dev['name']}…"
+            self._draw_footer()
+            dlg = PinDialog(
+                device_name = dev["name"],
+                on_submit   = self._pair_pin_submit,
+                on_cancel   = self._pair_cancel,
+            )
+            self._loop.widget = dlg
+
+        elif isinstance(ev, PairDoneEvent):
+            self._loop.widget = self._frame
+            if ev.ok:
+                self._status = f"  paired ✓ connecting {dev['name']}…"
+                self._signal()
+                threading.Thread(
+                    target=self._do_connect,
+                    args=(dev,),
+                    daemon=True
+                ).start()
+            else:
+                self._status = f"  pair failed: {ev.msg}"
+                self._signal()
+                self._bg_refresh()
+
+    # ── confirm dialog callbacks ──────────────────────────────────────────────
+    def _pair_confirm_yes(self):
+        child = self._pair_child
+        if child:
+            try: child.sendline("yes")
+            except Exception: pass
+        self._loop.widget = self._frame
+        self._status = f"  confirmed — waiting…"
+        self._draw_footer()
+
+    def _pair_confirm_no(self):
+        child = self._pair_child
+        if child:
+            try: child.sendline("no")
+            except Exception: pass
+        self._loop.widget = self._frame
+        self._status = "  pairing rejected"
+        self._draw_footer()
+
+    # ── PIN dialog callbacks ──────────────────────────────────────────────────
+    def _pair_pin_submit(self, pin):
+        child = self._pair_child
+        if child:
+            try: child.sendline(pin)
+            except Exception: pass
+        self._loop.widget = self._frame
+        self._status = "  PIN sent — waiting…"
+        self._draw_footer()
+
+    def _pair_cancel(self):
+        child = self._pair_child
+        if child:
+            try:
+                child.sendline("no")
+                child.close()
+            except Exception: pass
+        self._pair_child = None
+        self._loop.widget = self._frame
+        self._status = "  pairing cancelled"
+        self._draw_footer()
+
+    # ── filter ────────────────────────────────────────────────────────────────
+    def _on_filter(self, text):
+        self._filter = text.lower()
+        self._apply_filter()
+        self._rebuild_list()
+
+    def _on_filter_submit(self, text):
+        self._filter = text.lower()
+        self._apply_filter()
+        self._rebuild_list()
+        try:
+            self._frame.focus_position = "body"
+            self._frame.body.focus_position = 0
+            self._focus = "list"
+        except Exception: pass
+
+    def _apply_filter(self):
+        q = self._filter
+        self._filtered = [d for d in self._devices
+                          if q in d["name"].lower() or q in d["mac"].lower()] \
+                         if q else list(self._devices)
+
+    # ── key handler ───────────────────────────────────────────────────────────
+    def _handle_key(self, key):
+        if key in ("/", "s"):
+            self._frame.focus_position = "header"
+            return
+
+        if key == "tab":
+            if self._focus == "list":
+                self._focus = "info"
+                try:
+                    self._frame.focus_position = "body"
+                    self._frame.body.focus_position = 2
+                except Exception: pass
+            else:
+                self._focus = "list"
+                try:
+                    self._frame.focus_position = "body"
+                    self._frame.body.focus_position = 0
+                except Exception: pass
+            return
+
+        if key == "enter":
+            if self._focus == "list":
+                self._try_connect()
+            return
+
+        k = key.lower() if isinstance(key, str) else key
+
+        if   k == "r": threading.Thread(target=self._do_scan,       daemon=True).start()
+        elif k == "d": threading.Thread(target=self._do_disconnect,  daemon=True).start()
+        elif k == "t": threading.Thread(target=self._do_trust,       daemon=True).start()
+        elif k == "u": threading.Thread(target=self._do_untrust,     daemon=True).start()
+        elif k == "x": threading.Thread(target=self._do_remove,      daemon=True).start()
+        elif k == "i": self._show_info()
+        elif k == "b": threading.Thread(target=self._do_toggle_bt,   daemon=True).start()
+        elif k == "q": raise urwid.ExitMainLoop()
+
+    # ── connect / pair ────────────────────────────────────────────────────────
+    def _try_connect(self):
+        dev = self._focused_dev()
+        if not dev: return
+        mac  = dev["mac"]
+        name = dev["name"]
+
+        if dev["connected"]:
+            self._status = f"  already connected: {name}"
+            self._draw_footer()
+            return
+
+        if not dev["paired"]:
+            self._status = f"  pairing {name}…"; self._signal()
+            self._pairing_dev = dev
+            threading.Thread(
+                target=self._do_pair_interactive,
+                args=(dev,),
+                daemon=True
+            ).start()
+        else:
+            self._status = f"  connecting {name}…"; self._signal()
+            threading.Thread(target=self._do_connect, args=(dev,), daemon=True).start()
+
+    def _do_pair_interactive(self, dev):
+        """Run pexpect pairing; events are pushed back via _push_pair_event."""
+        def on_event(ev):
+            if isinstance(ev, (PairConfirmEvent, PairPinEvent)):
+                # Give child reference to UI before popping dialog
+                pass
+            self._push_pair_event(ev)
+
+        child_holder = [None]
+
+        def run():
+            child = pexpect.spawn("bluetoothctl", encoding="utf-8",
+                                  timeout=40, echo=False)
+            self._pair_child = child
+
+            try:
+                child.expect(r"\[bluetooth\].*#", timeout=10)
+            except Exception:
+                self._push_pair_event(PairDoneEvent(False, "bluetoothctl did not start"))
+                return
+
+            child.sendline(f"pair {dev['mac']}")
+
+            patterns = [
+                r"Confirm passkey (\d+)",           # 0
+                r"\[agent\] Confirm passkey (\d+)", # 1
+                r"\[agent\] Enter.*[Pp][Ii][Nn]",   # 2
+                r"Pairing successful",              # 3
+                r"Failed to pair",                  # 4
+                r"already paired",                  # 5
+                pexpect.EOF,                        # 6
+                pexpect.TIMEOUT,                    # 7
+            ]
+
+            while True:
+                try:
+                    idx = child.expect(patterns, timeout=40)
+                except Exception:
+                    self._push_pair_event(PairDoneEvent(False, "timeout / unexpected end"))
+                    break
+
+                if idx in (0, 1):
+                    passkey = child.match.group(1)
+                    self._push_pair_event(PairConfirmEvent(passkey))
+                    # Block until UI sends yes/no via child.sendline
+                    try:
+                        idx2 = child.expect([
+                            r"Pairing successful",
+                            r"Failed to pair",
+                            pexpect.EOF,
+                            pexpect.TIMEOUT,
+                        ], timeout=40)
+                        ok = idx2 == 0
+                    except Exception:
+                        ok = False
+                    self._push_pair_event(PairDoneEvent(ok, "paired" if ok else "pairing failed"))
+                    break
+
+                elif idx == 2:
+                    self._push_pair_event(PairPinEvent())
+                    try:
+                        idx2 = child.expect([
+                            r"Pairing successful",
+                            r"Failed to pair",
+                            pexpect.EOF,
+                            pexpect.TIMEOUT,
+                        ], timeout=40)
+                        ok = idx2 == 0
+                    except Exception:
+                        ok = False
+                    self._push_pair_event(PairDoneEvent(ok, "paired" if ok else "pairing failed"))
+                    break
+
+                elif idx == 3:
+                    self._push_pair_event(PairDoneEvent(True, "paired successfully"))
+                    break
+
+                elif idx in (4, 6, 7):
+                    self._push_pair_event(PairDoneEvent(False, "pairing failed"))
+                    break
+
+                elif idx == 5:
+                    self._push_pair_event(PairDoneEvent(True, "already paired"))
+                    break
+
+            try:
+                child.sendline("quit")
+                child.close()
+            except Exception:
+                pass
+
+        run()
+
+    def _do_connect(self, dev):
+        ok, msg = connect_device(dev["mac"])
+        self._status = f"  connected: {dev['name']}" if ok else "  connect failed"
+        self._bg_refresh()
+
+    # ── disconnect ────────────────────────────────────────────────────────────
+    def _do_disconnect(self):
+        dev = self._focused_dev()
+        if not dev: return
+        self._status = f"  disconnecting {dev['name']}…"; self._signal()
+        ok, _ = disconnect_device(dev["mac"])
+        self._status = f"  disconnected: {dev['name']}" if ok else "  disconnect failed"
+        self._bg_refresh()
+
+    # ── trust / untrust ───────────────────────────────────────────────────────
+    def _do_trust(self):
+        dev = self._focused_dev()
+        if not dev: return
+        ok, _ = trust_device(dev["mac"])
+        self._status = f"  trusted: {dev['name']}" if ok else "  trust failed"
+        self._bg_refresh()
+
+    def _do_untrust(self):
+        dev = self._focused_dev()
+        if not dev: return
+        ok, _ = untrust_device(dev["mac"])
+        self._status = f"  untrusted: {dev['name']}" if ok else "  untrust failed"
+        self._bg_refresh()
+
+    # ── remove ────────────────────────────────────────────────────────────────
+    def _do_remove(self):
+        dev = self._focused_dev()
+        if not dev: return
+        self._status = f"  removing {dev['name']}…"; self._signal()
+        ok, _ = remove_device(dev["mac"])
+        self._status = f"  removed: {dev['name']}" if ok else "  remove failed"
+        self._bg_refresh()
+
+    # ── scan ──────────────────────────────────────────────────────────────────
+    def _do_scan(self):
+        if self._scanning: return
+        self._scanning = True
+        self._status   = "  scanning for 30s…"; self._signal()
+        start_scan()
+        for i in range(6):
+            time.sleep(5)
+            self._bg_refresh()
+        self._scanning = False
+        self._status = "  scan complete"
+        self._bg_refresh()
+
+    # ── toggle bt ─────────────────────────────────────────────────────────────
+    def _do_toggle_bt(self):
+        toggle_bt(); time.sleep(1)
+        enabled = bt_enabled()
+        self._status = f"  bluetooth {'enabled' if enabled else 'disabled'}"
+        self._bg_refresh()
+
+    # ── info ──────────────────────────────────────────────────────────────────
+    def _show_info(self):
+        dev = self._focused_dev()
+        if not dev: return
+        self._info_dev = dev
+        self._rebuild_info()
+        self._focus = "info"
+        try:
+            self._frame.focus_position = "body"
+            self._frame.body.focus_position = 2
+        except Exception: pass
+
+    def _rebuild_info(self):
+        dev = self._info_dev
+        n   = len(self._filtered)
+        self._info_hdr.set_text([
+            ("col_hdr", "  details"),
+            ("dim",     f"  ({n} devices)"),
+        ])
+
+        rows = []
+        if not dev:
+            rows.append(SelectableRow(
+                [("dim", "  press [i] for details")],
+                focus_map="focus_info"
+            ))
+        else:
+            items = [
+                ("name",      dev["name"]),
+                ("mac",       dev["mac"]),
+                ("connected", "yes ▶" if dev["connected"] else "no"),
+                ("paired",    "yes" if dev["paired"] else "no"),
+                ("trusted",   "yes" if dev["trusted"] else "no"),
+                ("rssi",      dev["rssi"] or "—"),
+            ]
+            for k, v in items:
+                is_conn = k == "connected" and dev["connected"]
+                v_attr  = "active" if is_conn else "white"
+                markup_n = [
+                    ("dim",   f"  {k:<10}"),
+                    (v_attr,  f"  {v}"),
+                ]
+                markup_f = [
+                    ("red",   f" »{k:<10}"),
+                    (v_attr,  f"  {v}"),
+                ]
+                rows.append(SelectableRow(markup_n, markup_focused=markup_f, focus_map="focus_info"))
+
+        try:    old = self._info_box.focus_position
+        except: old = 0
+        self._info_body[:] = rows
+        if rows:
+            try: self._info_box.set_focus(min(old, len(rows)-1))
+            except Exception: pass
+
+    # ── background refresh ────────────────────────────────────────────────────
+    def _bg_refresh(self):
+        self._devices = get_devices()
+        self._apply_filter()
+        self._signal()
+
+    # ── focused dev ───────────────────────────────────────────────────────────
+    def _focused_dev(self):
+        try:
+            idx = self._list_box.focus_position
+            if 0 <= idx < len(self._filtered):
+                return self._filtered[idx]
+        except Exception: pass
+        return None
+
+    # ── list rebuild ──────────────────────────────────────────────────────────
+    def _rebuild_list(self):
+        n       = len(self._filtered)
+        enabled = bt_enabled()
+        self._bt_toggle.set_text(
+            ("good", "  on  ") if enabled else ("red_dim", "  off ")
+        )
+        scan_sfx = "  scanning…" if self._scanning else ""
+        self._col_hdr.set_text([
+            ("col_hdr", f"  {'name':<32}  {'mac':<20}  paired  trusted"),
+            ("dim",     f"   [{n}]{scan_sfx}"),
+        ])
+
+        rows = []
+        for dev in self._filtered:
+            name    = dev["name"][:32]
+            mac     = dev["mac"][:20]
+            paired  = "●" if dev["paired"]  else "○"
+            trusted = "●" if dev["trusted"] else "○"
+            active  = dev["connected"]
+
+            p_attr = "good"   if dev["paired"]  else "dim"
+            t_attr = "paired" if dev["trusted"] else "dim"
+
+            if active:
+                markup_n = [
+                    ("red_bold", "  ▶  "),
+                    ("active",   f"{name:<32}"),
+                    ("dim",      f"  {mac:<20}  "),
+                    (p_attr,     paired),
+                    ("dim",      "       "),
+                    (t_attr,     trusted),
+                ]
+                markup_f = [
+                    ("red_bold", " »▶  "),
+                    ("active",   f"{name:<32}"),
+                    ("dim",      f"  {mac:<20}  "),
+                    (p_attr,     paired),
+                    ("dim",      "       "),
+                    (t_attr,     trusted),
+                ]
+            else:
+                markup_n = [
+                    ("dim",   "     "),
+                    ("white", f"{name:<32}"),
+                    ("dim",   f"  {mac:<20}  "),
+                    (p_attr,  paired),
+                    ("dim",   "       "),
+                    (t_attr,  trusted),
+                ]
+                markup_f = [
+                    ("red",   "  »  "),
+                    ("white", f"{name:<32}"),
+                    ("dim",   f"  {mac:<20}  "),
+                    (p_attr,  paired),
+                    ("dim",   "       "),
+                    (t_attr,  trusted),
+                ]
+            rows.append(SelectableRow(markup_n, markup_focused=markup_f, focus_map="focus"))
+
+        try:    old = self._list_box.focus_position
+        except: old = 0
+        self._list_walker[:] = rows
+        if rows:
+            try: self._list_box.set_focus(min(old, len(rows)-1))
+            except Exception: pass
+
+    # ── footer draw ───────────────────────────────────────────────────────────
+    def _draw_footer(self):
+        connected = next((d for d in self._devices if d["connected"]), None)
+        if connected:
+            self._p_icon.set_text(("red_bold", "  ▶ "))
+            self._p_name.set_text([("bold", f" {connected['name']}")])
+            rssi = connected.get("rssi", "")
+            try:
+                rssi_val = int(rssi.replace("dBm","").strip())
+                pct  = max(0, min(100, int((rssi_val + 80) / 40 * 100)))
+                W    = 40
+                fill = int(pct / 100 * W)
+                emp  = W - fill
+                parts = []
+                if fill: parts.append(("bar_fill",  "━" * fill))
+                if emp:  parts.append(("bar_empty", "─" * emp))
+                self._p_bar.set_text(parts)
+                self._p_right.set_text(("dim", f"{rssi}"))
+            except Exception:
+                self._p_bar.set_text(("bar_empty", "─" * 40))
+                self._p_right.set_text(("dim", ""))
+        else:
+            self._p_icon.set_text(("dim", "  ── "))
+            self._p_name.set_text(("dim", "  no connection"))
+            self._p_bar.set_text(("bar_empty", "─" * 40))
+            self._p_right.set_text(("dim", ""))
+
+        self._p_status.set_text(("hint", f"  {self._status.strip()}"))
+
+    # ── tick ──────────────────────────────────────────────────────────────────
+    def _tick(self, loop, _data):
+        self._draw_footer()
+        self._loop.set_alarm_in(10, self._tick)
+
+    # ── run ───────────────────────────────────────────────────────────────────
+    def run(self):
+        threading.Thread(target=self._bg_refresh, daemon=True).start()
+        self._rebuild_list()
+        self._rebuild_info()
+        self._draw_footer()
+        self._loop.set_alarm_in(10, self._tick)
+        try:
+            self._loop.run()
+        except KeyboardInterrupt:
+            pass
+
+
+if __name__ == "__main__":
+    BTApp().run()
