@@ -1,0 +1,143 @@
+# ─────────────────────────────────────────────
+# Core layout (2-line prompt)
+# ─────────────────────────────────────────────
+add_newline = false
+
+format = """
+$os$directory$git_branch$fill$cmd_duration$time
+$character
+"""
+
+# ─────────────────────────────────────────────
+# OS (distro icon)
+# ─────────────────────────────────────────────
+[os]
+disabled = false
+format = "[$symbol](bold white) "
+
+[os.symbols]
+AIX = " "
+AlmaLinux = " "
+Alpaquita = " "
+Alpine = " "
+ALTLinux = " "
+Amazon = " "
+Android = " "
+AOSC = " "
+Arch = " "
+Artix = " "
+Bluefin = " "
+CachyOS = " "
+CentOS = " "
+Debian = " "
+DragonFly = " "
+Elementary = " "
+Emscripten = " "
+EndeavourOS = " "
+Fedora = " "
+FreeBSD = " "
+Garuda = " "
+Gentoo = " "
+HardenedBSD = "󰞌 "
+Illumos = " "
+InstantOS = " "
+Ios = "󰀷 "
+Kali = " "
+Linux = " "
+Mabox = " "
+Macos = " "
+Manjaro = " "
+Mariner = " "
+MidnightBSD = " "
+Mint = " "
+NetBSD = " "
+NixOS = " "
+Nobara = " "
+OpenBSD = " "
+OpenCloudOS = " "
+openEuler = " "
+openSUSE = " "
+OracleLinux = "󰺡 "
+PikaOS = " "
+Pop = " "
+Raspbian = " "
+Redhat = "󱄛 "
+RedHatEnterprise = "󱄛 "
+Redox = "󰀘 "
+RockyLinux = " "
+Solus = " "
+SUSE = " "
+Ubuntu = " "
+Ultramarine = " "
+Unknown = " "
+Uos = " "
+Void = " "
+Windows = "󰍲 "
+Zorin = " "
+
+# ─────────────────────────────────────────────
+# Directory (fancy folder style)
+# ─────────────────────────────────────────────
+[directory]
+style = "bold cyan"
+format = " [$path]($style) "
+truncation_length = 3
+truncate_to_repo = false
+home_symbol = "~"
+
+# ─────────────────────────────────────────────
+# Git branch (clean + icon)
+# ─────────────────────────────────────────────
+[git_branch]
+symbol = ""
+style = "bold green"
+format = "[$symbol $branch]($style) "
+
+# ─────────────────────────────────────────────
+# Fill (push right side)
+# ─────────────────────────────────────────────
+[fill]
+symbol = " "
+
+# ─────────────────────────────────────────────
+# Command duration
+# ─────────────────────────────────────────────
+[cmd_duration]
+min_time = 1000
+format = " [$duration](yellow) "
+
+# ─────────────────────────────────────────────
+# Time
+# ─────────────────────────────────────────────
+[time]
+disabled = false
+time_format = "%H:%M:%S"
+format = " [$time](blue)"
+
+# ─────────────────────────────────────────────
+# Prompt symbol (second line)
+# ─────────────────────────────────────────────
+[character]
+success_symbol = "[➜](bold green)"
+error_symbol = "[➜](bold red)"
+
+# ─────────────────────────────────────────────
+# Disable noisy modules
+# ─────────────────────────────────────────────
+[package]
+disabled = true
+
+[nodejs]
+disabled = true
+
+[python]
+disabled = true
+
+[rust]
+disabled = true
+
+[golang]
+disabled = true
+
+[java]
+disabled = true
